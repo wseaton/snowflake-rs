@@ -1,5 +1,5 @@
 use std::convert::TryFrom;
-use std::num::NonZero;
+use std::num::NonZeroUsize;
 
 use bytes::{Buf, Bytes};
 use polars_core::frame::DataFrame;
@@ -38,7 +38,7 @@ fn dataframe_from_json(json_result: &JsonResult) -> Result<DataFrame, PolarsCast
     let reader = std::io::Cursor::new(json_string.as_bytes());
     let df = JsonReader::new(reader)
         .with_json_format(JsonFormat::Json)
-        .infer_schema_len(Some(NonZero::new(5).unwrap()))
+        .infer_schema_len(NonZeroUsize::new(5))
         .finish()?;
     Ok(df)
 }
