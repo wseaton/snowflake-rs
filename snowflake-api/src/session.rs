@@ -338,7 +338,7 @@ impl Session {
                 body,
             )
             .await?;
-        log::debug!("Auth response: {:?}", resp);
+        log::debug!("Auth response: {resp:?}");
 
         match resp {
             AuthResponse::Login(lr) => {
