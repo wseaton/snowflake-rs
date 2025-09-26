@@ -2,7 +2,7 @@
 authors = ["Andrew Korzhuev <korzhuev@andrusha.me>"]
 categories = ["api-bindings", "database"]
 description = "Snowflake API bindings"
-documentation = "http://docs.rs/sqlite-api/"
+documentation = "http://docs.rs/snowflake-api/"
 edition = "2021"
 keywords = ["api", "database", "snowflake"]
 license = "Apache-2.0"
