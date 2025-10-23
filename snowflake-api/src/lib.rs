@@ -17,15 +17,17 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::Arc;
 
-use arrow::error::ArrowError;
-use arrow::ipc::reader::StreamReader;
-use arrow::record_batch::RecordBatch;
+use arrow_ipc::reader::StreamReader;
 use base64::Engine;
 use bytes::{Buf, Bytes};
 use futures::future::try_join_all;
 use regex::Regex;
 use reqwest_middleware::ClientWithMiddleware;
 use thiserror::Error;
+
+// Part of public interface
+pub use arrow_array::RecordBatch;
+pub use arrow_schema::ArrowError;
 
 use responses::ExecResponse;
 use session::{AuthError, Session};
@@ -56,7 +58,7 @@ pub enum SnowflakeApiError {
     ResponseDeserializationError(#[from] base64::DecodeError),
 
     #[error(transparent)]
-    ArrowError(#[from] arrow::error::ArrowError),
+    ArrowError(#[from] ArrowError),
 
     #[error("S3 bucket path in PUT request is invalid: `{0}`")]
     InvalidBucketPath(String),

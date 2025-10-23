@@ -9,7 +9,7 @@ license = "Apache-2.0"
 name = "snowflake-api"
 readme = "README.md"
 repository = "https://github.com/mycelial/snowflake-rs"
-version = "0.13.0"
+version = "0.14.0"
 
 [features]
 all = ["cert-auth", "polars"]
@@ -19,7 +19,9 @@ default = ["cert-auth"]
 polars = ["dep:polars-core", "dep:polars-io"]
 
 [dependencies]
-arrow = "56"
+arrow-array = "57"
+arrow-ipc = "57"
+arrow-schema = "57"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
@@ -54,7 +56,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 anyhow = "1"
-arrow = { version = "56", features = ["prettyprint"] }
+arrow = { version = "57", features = ["prettyprint"] }
 clap = { version = "4", features = ["derive"] }
 pretty_env_logger = "0.5"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
