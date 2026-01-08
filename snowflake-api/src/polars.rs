@@ -1,7 +1,8 @@
 use std::convert::TryFrom;
+use std::io::Cursor;
 use std::num::NonZeroUsize;
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use polars_core::frame::DataFrame;
 use polars_io::ipc::IpcStreamReader;
 use polars_io::json::{JsonFormat, JsonReader};
@@ -76,7 +77,7 @@ fn arrays_to_objects(json_result: &JsonResult) -> Result<Value, PolarsCastError>
 fn dataframe_from_bytes(bytes: Vec<Bytes>) -> Result<DataFrame, PolarsCastError> {
     let mut df = DataFrame::empty();
     for b in bytes {
-        let df_chunk = IpcStreamReader::new(b.reader()).finish()?;
+        let df_chunk = IpcStreamReader::new(Cursor::new(b)).finish()?;
         df.vstack_mut(&df_chunk)?;
     }
     df.align_chunks();
