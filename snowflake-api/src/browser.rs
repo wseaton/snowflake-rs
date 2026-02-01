@@ -78,52 +78,49 @@ pub fn wait_for_token(listener: &TcpListener) -> Result<String, BrowserAuthError
 
     let token = extract_token_from_request(&request_line)?;
 
-    let response = r#"HTTP/1.1 200 OK
-Content-Type: text/html
-Connection: close
-
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Authentication Complete</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .card {
-      background: white;
-      border-radius: 16px;
-      padding: 3em 4em;
-      text-align: center;
-      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
-    }
-    .checkmark {
-      font-size: 4em;
-      margin-bottom: 0.25em;
-    }
-    h1 { color: #1a1a2e; font-weight: 600; margin-bottom: 0.5em; }
-    p { color: #6b7280; font-size: 1.1em; }
-  </style>
-  <script>
-    window.onload = function() { window.open('', '_self', ''); window.close(); };
-  </script>
-</head>
-<body>
-  <div class="card">
-    <div class="checkmark">&#10003;</div>
-    <h1>Authentication Successful</h1>
-    <p>You can close this tab.</p>
-  </div>
-  <script>setTimeout(function() { window.close(); }, 5000);</script>
-</body>
-</html>"#;
+    let response = "HTTP/1.1 200 OK\r\n\
+Content-Type: text/html\r\n\
+Connection: close\r\n\
+\r\n\
+<!doctype html>\
+<html>\
+<head>\
+  <meta charset=\"utf-8\">\
+  <title>Authentication Complete</title>\
+  <style>\
+    * { margin: 0; padding: 0; box-sizing: border-box; }\
+    body {\
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;\
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);\
+      min-height: 100vh;\
+      display: flex;\
+      align-items: center;\
+      justify-content: center;\
+    }\
+    .card {\
+      background: white;\
+      border-radius: 16px;\
+      padding: 3em 4em;\
+      text-align: center;\
+      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);\
+    }\
+    .checkmark { font-size: 4em; margin-bottom: 0.25em; color: #22c55e; }\
+    h1 { color: #1a1a2e; font-weight: 600; margin-bottom: 0.5em; }\
+    p { color: #6b7280; font-size: 1.1em; }\
+  </style>\
+  <script>\
+    window.onload = function() { window.open('', '_self', ''); window.close(); };\
+  </script>\
+</head>\
+<body>\
+  <div class=\"card\">\
+    <div class=\"checkmark\">&#10003;</div>\
+    <h1>Authentication Successful</h1>\
+    <p>You can close this tab.</p>\
+  </div>\
+  <script>setTimeout(function() { window.close(); }, 5000);</script>\
+</body>\
+</html>";
 
     let _ = stream.write_all(response.as_bytes());
 
