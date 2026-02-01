@@ -83,11 +83,26 @@ pub struct AuthenticatorRequest {
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct AuthenticatorRequestData {
+    pub client_app_id: String,
+    pub client_app_version: String,
+    pub svn_revision: String,
     pub account_name: String,
     pub login_name: String,
     pub authenticator: String,
     /// Port for the local callback listener
     pub browser_mode_redirect_port: String,
+    /// Proof key for the SSO challenge
+    pub proof_key: String,
+    pub client_environment: AuthenticatorClientEnvironment,
+}
+
+#[cfg(feature = "browser-auth")]
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct AuthenticatorClientEnvironment {
+    pub application: String,
+    pub os: String,
+    pub os_version: String,
 }
 
 /// Request data for the second phase of browser SSO authentication.
