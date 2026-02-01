@@ -456,10 +456,19 @@ impl Session {
         // Step 3: Send authenticator-request to get SSO URL
         let auth_request = AuthenticatorRequest {
             data: AuthenticatorRequestData {
+                client_app_id: "Go".to_string(),
+                client_app_version: "1.6.22".to_string(),
+                svn_revision: String::new(),
                 account_name: self.account_identifier.clone(),
                 login_name: self.username.clone(),
                 authenticator: "EXTERNALBROWSER".to_string(),
                 browser_mode_redirect_port: port.to_string(),
+                proof_key: proof_key.clone(),
+                client_environment: crate::requests::AuthenticatorClientEnvironment {
+                    application: "Rust".to_string(),
+                    os: std::env::consts::OS.to_string(),
+                    os_version: "unknown".to_string(),
+                },
             },
         };
 
