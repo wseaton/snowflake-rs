@@ -170,21 +170,13 @@ impl Connection {
         // todo: persist client to use connection polling
         let resp = self
             .client
-            .post(url.clone())
+            .post(url)
             .headers(headers)
             .json(&body)
             .send()
             .await?;
 
-        // Debug: log raw response for troubleshooting auth issues
-        let status = resp.status();
-        let body_text = resp.text().await?;
-        log::debug!("Response from {}: status={}, body={}", url.path(), status, &body_text);
-
-        serde_json::from_str(&body_text).map_err(|e| {
-            log::error!("Failed to deserialize response: {}. Body was: {}", e, &body_text);
-            ConnectionError::Deserialization(e)
-        })
+        Ok(resp.json().await?)
     }
 
     pub async fn get_chunk(

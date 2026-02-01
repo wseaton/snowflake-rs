@@ -448,7 +448,6 @@ impl Session {
 
         // Step 1: Create local listener for callback
         let (listener, port) = create_local_listener()?;
-        log::debug!("Started local callback listener on port {port}");
 
         // Step 2: Generate proof key
         let proof_key = generate_proof_key();
@@ -483,11 +482,8 @@ impl Session {
             )
             .await?;
 
-        let sso_url = match resp {
-            AuthResponse::Auth(auth_resp) => {
-                log::debug!("Got SSO URL: {}", auth_resp.data.sso_url);
-                auth_resp.data.sso_url
-            }
+        let (sso_url, server_proof_key) = match resp {
+            AuthResponse::Auth(auth_resp) => (auth_resp.data.sso_url, auth_resp.data.proof_key),
             AuthResponse::Error(e) => {
                 return Err(AuthError::AuthFailed(
                     e.code.unwrap_or_default(),
@@ -497,17 +493,21 @@ impl Session {
             _ => return Err(AuthError::UnexpectedResponse),
         };
 
+        // Use the server-returned proof_key for the login request
+        // The server may modify the proof key, and the login request must match
+        let final_proof_key = if server_proof_key.is_empty() {
+            proof_key
+        } else {
+            server_proof_key
+        };
+
         // Step 4: Open browser with SSO URL
-        log::info!("Opening browser for SSO authentication...");
         open_browser(&sso_url)?;
 
         // Step 5: Wait for token on local listener (blocking)
-        // Run in a blocking task to avoid blocking the async runtime
         let token = tokio::task::spawn_blocking(move || wait_for_token(&listener))
             .await
             .map_err(|_| AuthError::TokenFetchFailed)??;
-
-        log::debug!("Received token from browser callback");
 
         // Step 6: Send login-request with token and proof key
         let login_request = BrowserLoginRequest {
@@ -515,7 +515,7 @@ impl Session {
                 login_request_common: self.login_request_common(),
                 authenticator: "EXTERNALBROWSER".to_string(),
                 token,
-                proof_key,
+                proof_key: final_proof_key,
             },
         };
 
