@@ -157,18 +157,57 @@ impl From<ExecResponseRowType> for FieldSchema {
     }
 }
 
-/// Container for query result.
-/// Arrow is returned by-default for all SELECT statements,
-/// unless there is session configuration issue or it's a different statement type.
-pub enum QueryResult {
+/// Per-query metadata Snowflake returns alongside the result body. Carried
+/// on [`QueryResult`], [`RawQueryResult`], and the streaming entry points so
+/// callers can correlate a result with its `queryId` (for history /
+/// debugging / `cancel_query`), see which session context actually executed
+/// it, and short-circuit on row count without scanning batches.
+#[derive(Debug, Clone)]
+pub struct QueryMetadata {
+    pub query_id: String,
+    /// Total rows in the full result. For Arrow responses this is the
+    /// authoritative count without summing `RecordBatch::num_rows()`. None
+    /// on PUT (no row concept).
+    pub total_rows: Option<i64>,
+    /// Total chunks the streaming path will yield (inline first-page +
+    /// external chunks). Useful as the denominator for `pct = seen / total`
+    /// progress display in dashboards. None for non-streaming responses.
+    pub total_chunks: Option<usize>,
+    /// Snowflake's internal statement-type code (e.g. `0x1000` SELECT,
+    /// `0x3100` INSERT). Raw integer; gosnowflake's enum mapping isn't
+    /// replicated here yet.
+    pub statement_type_id: Option<i64>,
+    /// Session context that executed the query. Optional because PUT and
+    /// some session-less paths omit them.
+    pub warehouse: Option<String>,
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub role: Option<String>,
+}
+
+/// Container for a successful query response: [`QueryMetadata`] + rows.
+/// Arrow is returned by default for SELECTs unless the session is
+/// configured otherwise.
+pub struct QueryResult {
+    pub metadata: QueryMetadata,
+    pub data: QueryData,
+}
+
+pub enum QueryData {
     Arrow(Vec<RecordBatch>),
     Json(JsonResult),
     Empty,
 }
 
-/// Raw query result
-/// Can be transformed into [`QueryResult`]
-pub enum RawQueryResult {
+/// Raw counterpart to [`QueryResult`]: Arrow IPC bytes or JSON, plus
+/// metadata. Convertible into [`QueryResult`] via
+/// [`RawQueryResult::deserialize_arrow`].
+pub struct RawQueryResult {
+    pub metadata: QueryMetadata,
+    pub data: RawQueryData,
+}
+
+pub enum RawQueryData {
     /// Arrow IPC chunks
     /// see: <https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc>
     Bytes(Vec<Bytes>),
@@ -249,13 +288,15 @@ fn build_record_batch_stream(raw: ArrowChunkStream) -> RecordBatchStream {
 
 impl RawQueryResult {
     pub fn deserialize_arrow(self) -> Result<QueryResult, ArrowError> {
-        match self {
-            RawQueryResult::Bytes(bytes) => {
-                Self::flat_bytes_to_batches(bytes).map(QueryResult::Arrow)
-            }
-            RawQueryResult::Json(j) => Ok(QueryResult::Json(j)),
-            RawQueryResult::Empty => Ok(QueryResult::Empty),
-        }
+        let data = match self.data {
+            RawQueryData::Bytes(bytes) => QueryData::Arrow(Self::flat_bytes_to_batches(bytes)?),
+            RawQueryData::Json(j) => QueryData::Json(j),
+            RawQueryData::Empty => QueryData::Empty,
+        };
+        Ok(QueryResult {
+            metadata: self.metadata,
+            data,
+        })
     }
 
     fn flat_bytes_to_batches(bytes: Vec<Bytes>) -> Result<Vec<RecordBatch>, ArrowError> {
@@ -549,13 +590,17 @@ impl SnowflakeApi {
         // put commands go through a different flow and result is side-effect
         if put_re.is_match(sql) {
             log::info!("Detected PUT query");
-            self.exec_put(sql).await.map(|()| RawQueryResult::Empty)
+            let metadata = self.exec_put(sql).await?;
+            Ok(RawQueryResult {
+                metadata,
+                data: RawQueryData::Empty,
+            })
         } else {
             self.exec_arrow_raw(sql).await
         }
     }
 
-    async fn exec_put(&self, sql: &str) -> Result<(), SnowflakeApiError> {
+    async fn exec_put(&self, sql: &str) -> Result<QueryMetadata, SnowflakeApiError> {
         let (_, resp) = self
             .run_sql::<ExecResponse>(sql, QueryType::JsonQuery)
             .await?;
@@ -565,7 +610,20 @@ impl SnowflakeApi {
             ExecResponse::Query(_) | ExecResponse::QueryAsync(_) => {
                 Err(SnowflakeApiError::UnexpectedResponse)
             }
-            ExecResponse::PutGet(pg) => put::put(pg).await,
+            ExecResponse::PutGet(pg) => {
+                let metadata = QueryMetadata {
+                    query_id: pg.data.query_id.clone(),
+                    total_rows: None,
+                    total_chunks: None,
+                    statement_type_id: pg.data.statement_type_id,
+                    warehouse: None,
+                    database: None,
+                    schema: None,
+                    role: None,
+                };
+                put::put(pg).await?;
+                Ok(metadata)
+            }
             ExecResponse::Error(e) => Err(SnowflakeApiError::ApiError(
                 e.data.error_code,
                 e.message.unwrap_or_default(),
@@ -679,7 +737,11 @@ impl SnowflakeApi {
                 ));
             }
             log::info!("Detected PUT query");
-            self.exec_put(sql).await.map(|()| RawQueryResult::Empty)
+            let metadata = self.exec_put(sql).await?;
+            Ok(RawQueryResult {
+                metadata,
+                data: RawQueryData::Empty,
+            })
         } else {
             self.exec_arrow_raw_with_cancel(sql, request_id, binds, cancel)
                 .await
@@ -758,12 +820,12 @@ impl SnowflakeApi {
         binds: &[Bind],
         cancel: &CancellationToken,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
-        match self
+        let (metadata, body) = self
             .resolve_arrow_query(sql, request_id, binds, cancel)
-            .await?
-        {
-            ResolvedArrowResult::Empty => Ok(RawQueryResult::Empty),
-            ResolvedArrowResult::Json(j) => Ok(RawQueryResult::Json(j)),
+            .await?;
+        let data = match body {
+            ResolvedArrowResult::Empty => RawQueryData::Empty,
+            ResolvedArrowResult::Json(j) => RawQueryData::Json(j),
             ResolvedArrowResult::Chunked {
                 inline_base64,
                 chunks,
@@ -786,9 +848,10 @@ impl SnowflakeApi {
                     bytes.insert(0, inline);
                 }
 
-                Ok(RawQueryResult::Bytes(bytes))
+                RawQueryData::Bytes(bytes)
             }
-        }
+        };
+        Ok(RawQueryResult { metadata, data })
     }
 
     async fn resolve_arrow_query(
@@ -797,7 +860,7 @@ impl SnowflakeApi {
         request_id: Option<Uuid>,
         binds: &[Bind],
         cancel: &CancellationToken,
-    ) -> Result<ResolvedArrowResult, SnowflakeApiError> {
+    ) -> Result<(QueryMetadata, ResolvedArrowResult), SnowflakeApiError> {
         if cancel.is_cancelled() {
             return Err(SnowflakeApiError::QueryCancelled);
         }
@@ -838,17 +901,45 @@ impl SnowflakeApi {
             )),
         }?;
 
-        if resp.data.returned == 0 {
-            Ok(ResolvedArrowResult::Empty)
+        // Metadata is captured before resp.data is moved into the body
+        // variants below.
+        let total_rows = Some(resp.data.total);
+        let statement_type_id = Some(resp.data.statement_type_id);
+        let warehouse = resp.data.final_warehouse_name.clone();
+        let database = resp.data.final_database_name.clone();
+        let schema = resp.data.final_schema_name.clone();
+        let role = Some(resp.data.final_role_name.clone());
+        let query_id = resp.data.query_id.clone();
+
+        let inline_present = resp
+            .data
+            .rowset_base64
+            .as_ref()
+            .is_some_and(|s| !s.is_empty());
+        let total_chunks = Some(resp.data.chunks.len() + usize::from(inline_present));
+
+        let metadata = QueryMetadata {
+            query_id,
+            total_rows,
+            total_chunks,
+            statement_type_id,
+            warehouse,
+            database,
+            schema,
+            role,
+        };
+
+        let body = if resp.data.returned == 0 {
+            ResolvedArrowResult::Empty
         } else if let Some(value) = resp.data.rowset {
             // JSON for SELECT only happens when the session is configured for it
             // (debugging path); the default for SELECT is Arrow.
-            Ok(ResolvedArrowResult::Json(JsonResult {
+            ResolvedArrowResult::Json(JsonResult {
                 value,
                 schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
-            }))
+            })
         } else if let Some(base64) = resp.data.rowset_base64 {
-            Ok(ResolvedArrowResult::Chunked {
+            ResolvedArrowResult::Chunked {
                 inline_base64: if base64.is_empty() {
                     None
                 } else {
@@ -856,10 +947,11 @@ impl SnowflakeApi {
                 },
                 chunks: resp.data.chunks,
                 chunk_headers: resp.data.chunk_headers,
-            })
+            }
         } else {
-            Err(SnowflakeApiError::BrokenResponse)
-        }
+            return Err(SnowflakeApiError::BrokenResponse);
+        };
+        Ok((metadata, body))
     }
 
     /// Cancellation governs setup only; once the stream is returned, dropping
@@ -870,24 +962,25 @@ impl SnowflakeApi {
         request_id: Option<Uuid>,
         binds: &[Bind],
         cancel: &CancellationToken,
-    ) -> Result<ArrowChunkStream, SnowflakeApiError> {
-        match self
+    ) -> Result<(QueryMetadata, ArrowChunkStream), SnowflakeApiError> {
+        let (metadata, body) = self
             .resolve_arrow_query(sql, request_id, binds, cancel)
-            .await?
-        {
-            ResolvedArrowResult::Empty => Ok(stream::empty().boxed()),
-            ResolvedArrowResult::Json(_) => Err(SnowflakeApiError::JsonStreamUnsupported),
+            .await?;
+        let stream = match body {
+            ResolvedArrowResult::Empty => stream::empty().boxed(),
+            ResolvedArrowResult::Json(_) => return Err(SnowflakeApiError::JsonStreamUnsupported),
             ResolvedArrowResult::Chunked {
                 inline_base64,
                 chunks,
                 chunk_headers,
-            } => Ok(build_arrow_chunk_stream(
+            } => build_arrow_chunk_stream(
                 Arc::clone(&self.connection),
                 inline_base64,
                 chunks,
                 chunk_headers,
-            )),
-        }
+            ),
+        };
+        Ok((metadata, stream))
     }
 
     /// Run a SQL statement, generating fresh request params. Returns both
@@ -1123,9 +1216,11 @@ impl<'a> QueryBuilder<'a> {
     ///
     /// Errors with [`SnowflakeApiError::JsonStreamUnsupported`] if the
     /// response is JSON. Returns an empty stream for empty results.
-    pub async fn execute_stream(self) -> Result<RecordBatchStream, SnowflakeApiError> {
-        let raw = self.execute_stream_raw().await?;
-        Ok(build_record_batch_stream(raw))
+    pub async fn execute_stream(
+        self,
+    ) -> Result<(QueryMetadata, RecordBatchStream), SnowflakeApiError> {
+        let (metadata, raw) = self.execute_stream_raw().await?;
+        Ok((metadata, build_record_batch_stream(raw)))
     }
 
     /// Run the query and return a stream of raw Arrow IPC blobs, one per
@@ -1133,7 +1228,9 @@ impl<'a> QueryBuilder<'a> {
     /// yielded as item 0; external chunk downloads follow with bounded
     /// prefetch. Useful for forwarding Arrow IPC over HTTP/SSE without a
     /// decode/re-encode round-trip.
-    pub async fn execute_stream_raw(self) -> Result<ArrowChunkStream, SnowflakeApiError> {
+    pub async fn execute_stream_raw(
+        self,
+    ) -> Result<(QueryMetadata, ArrowChunkStream), SnowflakeApiError> {
         let owned;
         let _drop_guard;
         let cancel = match self.cancel {

@@ -257,6 +257,7 @@ pub struct ExecResponseChunk {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PutGetResponseData {
+    pub query_id: String,
     // `kind`, `operation` are present in Go implementation, but not in .NET
     pub command: CommandType,
     pub local_location: Option<String>,

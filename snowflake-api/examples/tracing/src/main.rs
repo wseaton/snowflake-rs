@@ -10,7 +10,7 @@ use reqwest_tracing::{OtelName, SpanBackendWithUrl};
 use tracing_subscriber::layer::SubscriberExt;
 
 use snowflake_api::connection::Connection;
-use snowflake_api::{AuthArgs, QueryResult, SnowflakeApiBuilder};
+use snowflake_api::{AuthArgs, QueryData, SnowflakeApiBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,15 +52,16 @@ async fn main() -> Result<()> {
 #[tracing::instrument(name = "snowflake_api", skip(api))]
 async fn run_in_span(api: &snowflake_api::SnowflakeApi) -> anyhow::Result<()> {
     let res = api.exec("select 'hello from snowflake' as col1;").await?;
+    println!("query_id: {}", res.metadata.query_id);
 
-    match res {
-        QueryResult::Arrow(a) => {
+    match res.data {
+        QueryData::Arrow(a) => {
             println!("{}", pretty_format_batches(&a).unwrap());
         }
-        QueryResult::Json(j) => {
+        QueryData::Json(j) => {
             println!("{}", j);
         }
-        QueryResult::Empty => {
+        QueryData::Empty => {
             println!("Query finished successfully")
         }
     }

@@ -5,7 +5,7 @@ use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
 use std::fs;
 
-use snowflake_api::{QueryResult, SnowflakeApi};
+use snowflake_api::{QueryData, SnowflakeApi};
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum Output {
@@ -94,14 +94,15 @@ async fn main() -> Result<()> {
     match args.output {
         Output::Arrow => {
             let res = api.exec(&args.sql).await?;
-            match res {
-                QueryResult::Arrow(a) => {
+            println!("query_id: {}", res.metadata.query_id);
+            match res.data {
+                QueryData::Arrow(a) => {
                     println!("{}", pretty_format_batches(&a).unwrap());
                 }
-                QueryResult::Json(j) => {
+                QueryData::Json(j) => {
                     println!("{j}");
                 }
-                QueryResult::Empty => {
+                QueryData::Empty => {
                     println!("Query finished successfully")
                 }
             }

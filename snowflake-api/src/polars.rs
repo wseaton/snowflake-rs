@@ -11,7 +11,7 @@ use serde::de::Error;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::{JsonResult, RawQueryResult};
+use crate::{JsonResult, RawQueryData, RawQueryResult};
 
 #[derive(Error, Debug)]
 pub enum PolarsCastError {
@@ -24,10 +24,10 @@ pub enum PolarsCastError {
 
 impl RawQueryResult {
     pub fn to_polars(self) -> Result<DataFrame, PolarsCastError> {
-        match self {
-            RawQueryResult::Bytes(bytes) => dataframe_from_bytes(bytes),
-            RawQueryResult::Json(json) => dataframe_from_json(&json),
-            RawQueryResult::Empty => Ok(DataFrame::empty()),
+        match self.data {
+            RawQueryData::Bytes(bytes) => dataframe_from_bytes(bytes),
+            RawQueryData::Json(json) => dataframe_from_json(&json),
+            RawQueryData::Empty => Ok(DataFrame::empty()),
         }
     }
 }

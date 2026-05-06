@@ -1,7 +1,7 @@
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
-use snowflake_api::{QueryResult, SnowflakeApi};
+use snowflake_api::{QueryData, SnowflakeApi};
 
 extern crate snowflake_api;
 
@@ -41,15 +41,16 @@ async fn main() -> Result<()> {
 
     log::info!("Querying for results");
     let res = api.exec("SELECT * FROM OSCAR_AGE_MALE;").await?;
+    log::info!("query_id: {}", res.metadata.query_id);
 
-    match res {
-        QueryResult::Arrow(a) => {
+    match res.data {
+        QueryData::Arrow(a) => {
             println!("{}", pretty_format_batches(&a).unwrap());
         }
-        QueryResult::Empty => {
+        QueryData::Empty => {
             println!("Nothing was returned");
         }
-        QueryResult::Json(j) => {
+        QueryData::Json(j) => {
             println!("{j}");
         }
     }
