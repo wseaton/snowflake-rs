@@ -20,6 +20,7 @@ default = ["cert-auth"]
 polars = ["dep:polars-core", "dep:polars-io"]
 
 [dependencies]
+arc-swap = "1"
 arrow-array = "57"
 arrow-ipc = "57"
 arrow-schema = "57"
