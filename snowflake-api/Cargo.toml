@@ -21,22 +21,22 @@ polars = ["dep:polars-core", "dep:polars-io"]
 
 [dependencies]
 arc-swap = "1"
-arrow-array = "57"
-arrow-ipc = "57"
-arrow-schema = "57"
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-schema = "58"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 futures = "0.3"
 log = "0.4"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "gzip",
     "json",
-    "rustls-tls",
+    "rustls",
 ] }
-reqwest-middleware = { version = "0.4", features = ["json"] }
-reqwest-retry = "0.7"
+reqwest-middleware = { version = "0.5", features = ["json"] }
+reqwest-retry = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 snowflake-jwt = { version = "0.3", optional = true }
@@ -52,7 +52,7 @@ polars-io = { version = ">=0.41", features = [
 ], optional = true }
 
 # browser-auth support
-getrandom = { version = "0.3", optional = true }
+getrandom = { version = "0.4", optional = true }
 urlencoding = { version = "2", optional = true }
 open = { version = "5", optional = true }
 
@@ -64,7 +64,7 @@ tokio-util = { version = "0.7", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"
-arrow = { version = "57", features = ["prettyprint"] }
+arrow = { version = "58", features = ["prettyprint"] }
 clap = { version = "4", features = ["derive"] }
 pretty_env_logger = "0.5"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
