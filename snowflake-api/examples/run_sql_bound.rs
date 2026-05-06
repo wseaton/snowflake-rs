@@ -11,7 +11,7 @@ extern crate snowflake_api;
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 
-use snowflake_api::{Bind, QueryResult, SnowflakeApi};
+use snowflake_api::{Bind, QueryData, SnowflakeApi};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,10 +30,11 @@ async fn main() -> Result<()> {
         .execute()
         .await?;
 
-    match res {
-        QueryResult::Arrow(a) => println!("{}", pretty_format_batches(&a).unwrap()),
-        QueryResult::Json(j) => println!("{j}"),
-        QueryResult::Empty => println!("Query finished with empty result"),
+    println!("query_id: {}", res.metadata.query_id);
+    match res.data {
+        QueryData::Arrow(a) => println!("{}", pretty_format_batches(&a).unwrap()),
+        QueryData::Json(j) => println!("{j}"),
+        QueryData::Empty => println!("Query finished with empty result"),
     }
 
     // Explicit constructors are still available when you want to nail
@@ -43,7 +44,7 @@ async fn main() -> Result<()> {
         .binds([Bind::text("typed"), Bind::null("FIXED")])
         .execute()
         .await?;
-    if let QueryResult::Arrow(a) = res {
+    if let QueryData::Arrow(a) = res.data {
         println!("{}", pretty_format_batches(&a).unwrap());
     }
 

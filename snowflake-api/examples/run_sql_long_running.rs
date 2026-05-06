@@ -19,7 +19,7 @@ extern crate snowflake_api;
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 
-use snowflake_api::{QueryResult, SnowflakeApi};
+use snowflake_api::{QueryData, SnowflakeApi};
 
 const RECURSIVE_CTE: &str = "\
 WITH RECURSIVE Compute_CTE AS (
@@ -40,11 +40,12 @@ async fn main() -> Result<()> {
     let started = std::time::Instant::now();
     let res = api.exec(sql).await?;
     log::info!("Query finished in {:?}", started.elapsed());
+    log::info!("query_id: {}", res.metadata.query_id);
 
-    match res {
-        QueryResult::Arrow(a) => println!("{}", pretty_format_batches(&a).unwrap()),
-        QueryResult::Json(j) => println!("{j}"),
-        QueryResult::Empty => println!("Query finished successfully"),
+    match res.data {
+        QueryData::Arrow(a) => println!("{}", pretty_format_batches(&a).unwrap()),
+        QueryData::Json(j) => println!("{j}"),
+        QueryData::Empty => println!("Query finished successfully"),
     }
     Ok(())
 }

@@ -56,7 +56,9 @@ async fn main() -> Result<()> {
 
     match args.mode {
         Mode::Batches => {
-            let mut stream = api.query(sql).execute_stream().await?;
+            let (meta, mut stream) = api.query(sql).execute_stream().await?;
+            println!("query_id: {}", meta.query_id);
+            let total_chunks = meta.total_chunks.unwrap_or(0);
             let mut idx = 0usize;
             let mut total_rows = 0usize;
             while let Some(batch) = stream.next().await {
@@ -73,17 +75,30 @@ async fn main() -> Result<()> {
                 }
                 idx += 1;
             }
-            println!("done; {idx} batch(es), {total_rows} row(s)");
+            println!(
+                "done; {idx} batch(es), {total_rows} row(s) (of {} chunks total)",
+                total_chunks
+            );
         }
         Mode::Raw => {
-            let mut stream = api.query(sql).execute_stream_raw().await?;
+            let (meta, mut stream) = api.query(sql).execute_stream_raw().await?;
+            println!("query_id: {}", meta.query_id);
+            let total_chunks = meta.total_chunks.unwrap_or(0);
             let mut idx = 0usize;
             let mut total_bytes = 0usize;
             while let Some(blob) = stream.next().await {
                 let blob = blob?;
-                println!("chunk {idx}: {} bytes of Arrow IPC", blob.len());
-                total_bytes += blob.len();
                 idx += 1;
+                let pct = if total_chunks > 0 {
+                    (idx * 100) / total_chunks
+                } else {
+                    0
+                };
+                println!(
+                    "chunk {idx}/{total_chunks} ({pct}%): {} bytes of Arrow IPC",
+                    blob.len()
+                );
+                total_bytes += blob.len();
             }
             println!("done; {idx} chunk(s), {total_bytes} bytes total");
         }
