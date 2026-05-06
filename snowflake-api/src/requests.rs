@@ -19,6 +19,12 @@ pub struct ExecRequest {
     /// serialized as omitted so unbound queries don't send the field at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bindings: Option<HashMap<String, BindParam>>,
+    /// Per-statement parameters injected into the request body. Used today
+    /// for `MULTI_STATEMENT_COUNT`; gosnowflake's `parameters` field on the
+    /// same endpoint takes any session-level parameter name as a key.
+    /// Empty -> omitted from the wire.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub parameters: HashMap<String, serde_json::Value>,
 }
 
 /// One positional bind parameter on the wire. The Snowflake type name goes in
