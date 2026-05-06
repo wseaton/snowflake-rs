@@ -74,6 +74,10 @@ pub type ExecErrorResponse = BaseRestResponse<ExecErrorResponseData>;
 /// (or sometimes a sparse object); we keep it as a free-form Value so the
 /// parser doesn't choke.
 pub type CancelQueryResponse = BaseRestResponse<serde_json::Value>;
+/// Response from `GET /monitoring/queries/{queryId}`. Used by
+/// `SnowflakeApi::query_status` to peek at a query without consuming
+/// warehouse credits or buffering results.
+pub type MonitoringResponse = BaseRestResponse<MonitoringResponseData>;
 pub type AuthErrorResponse = BaseRestResponse<AuthErrorResponseData>;
 pub type AuthenticatorResponse = BaseRestResponse<AuthenticatorResponseData>;
 pub type LoginResponse = BaseRestResponse<LoginResponseData>;
@@ -98,6 +102,28 @@ pub struct ExecErrorResponseData {
     // errors omit these. Per spiceai-1.1.
     pub query_id: Option<String>,
     pub sql_state: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringResponseData {
+    /// In practice Snowflake returns either zero (unknown id) or one entry
+    /// for the requested `query_id`. The list shape mirrors the wire format.
+    #[serde(default)]
+    pub queries: Vec<MonitoringQueryEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct MonitoringQueryEntry {
+    /// Echoed `queryId`.
+    pub id: String,
+    /// gosnowflake's wire string, e.g. `"RUNNING"`, `"SUCCESS"`,
+    /// `"FAILED_WITH_ERROR"`. Always present per gosnowflake.
+    pub status: String,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]

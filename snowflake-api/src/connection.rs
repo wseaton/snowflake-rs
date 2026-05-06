@@ -54,6 +54,10 @@ pub enum QueryType {
     /// caller opted into `client_session_keep_alive` on the builder. Body
     /// is empty; auth is the current session token.
     Heartbeat,
+    /// GET /monitoring/queries/{`queryId`}. Status-only round-trip used by
+    /// `SnowflakeApi::query_status` for the deferred-fetch flow; does not
+    /// consume warehouse credits or buffer results.
+    MonitoringQuery(String),
 }
 
 impl QueryType {
@@ -106,6 +110,12 @@ impl QueryType {
                 path: Cow::Borrowed("session/heartbeat"),
                 accept_mime: "application/snowflake",
                 method: Method::POST,
+            },
+            Self::MonitoringQuery(query_id) => QueryContext {
+                path: Cow::Owned(format!("monitoring/queries/{query_id}")),
+                // Endpoint rejects application/snowflake with 406; always JSON.
+                accept_mime: "application/json",
+                method: Method::GET,
             },
         }
     }
@@ -258,12 +268,14 @@ impl Connection {
             }
         };
 
+        let status = resp.status();
         let bytes = resp.bytes().await?;
         match serde_json::from_slice::<R>(&bytes) {
             Ok(parsed) => Ok(parsed),
             Err(e) => {
                 log::debug!(
-                    "Failed to deserialize response body: {} | body: {}",
+                    "Failed to deserialize response body (status={}): {} | body: {}",
+                    status,
                     e,
                     String::from_utf8_lossy(&bytes)
                 );

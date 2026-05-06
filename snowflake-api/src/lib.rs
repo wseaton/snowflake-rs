@@ -46,7 +46,7 @@ pub use crate::requests::Bind;
 use crate::requests::{AbortRequest, ExecRequest};
 use crate::responses::{
     is_query_in_progress, is_query_not_executing, is_session_expired, is_sql_execution_cancelled,
-    CancelQueryResponse, ExecResponseRowType,
+    CancelQueryResponse, ExecResponseRowType, MonitoringResponse, QueryExecResponseData,
 };
 use crate::session::AuthError::MissingEnvArgument;
 
@@ -193,6 +193,92 @@ pub struct QueryResult {
     pub data: QueryData,
 }
 
+/// Returned by [`SnowflakeApi::submit_async`] / [`QueryBuilder::submit_async`].
+/// Both ids are useful: `request_id` is what [`SnowflakeApi::cancel_query`]
+/// understands (same-process abort path), `query_id` is what
+/// [`SnowflakeApi::query_status`] / [`SnowflakeApi::fetch_results`] expect
+/// (cross-process / cross-worker dispatch).
+#[derive(Debug, Clone)]
+pub struct QueryHandle {
+    pub request_id: Uuid,
+    pub query_id: String,
+}
+
+/// Mirrors gosnowflake's `monitoring.go` query-status constants. `Other`
+/// is the catch-all so a new server-side status doesn't immediately break
+/// callers; treat unknown values as non-terminal until proven otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryStatus {
+    Running,
+    Aborting,
+    Success,
+    FailedWithError,
+    Aborted,
+    Queued,
+    FailedWithIncident,
+    Disconnected,
+    ResumingWarehouse,
+    QueueRepairingWarehouse,
+    Restarted,
+    Blocked,
+    /// `/monitoring/queries/<id>` returned an empty `queries` array.
+    /// Snowflake does this for unknown / not-yet-visible ids.
+    NoData,
+    Other(String),
+}
+
+impl QueryStatus {
+    /// `true` if Snowflake will not transition out of this state.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::FailedWithError | Self::Aborted | Self::FailedWithIncident
+        )
+    }
+
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    /// Active states that warrant continued polling. `NoData` and `Other`
+    /// fall through to neither bucket: callers decide whether to retry.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self,
+            Self::Running
+                | Self::Queued
+                | Self::ResumingWarehouse
+                | Self::QueueRepairingWarehouse
+                | Self::Blocked
+                | Self::Restarted
+        )
+    }
+
+    fn from_wire(s: &str) -> Self {
+        match s {
+            "RUNNING" => Self::Running,
+            "ABORTING" => Self::Aborting,
+            "SUCCESS" => Self::Success,
+            "FAILED_WITH_ERROR" => Self::FailedWithError,
+            "ABORTED" => Self::Aborted,
+            "QUEUED" => Self::Queued,
+            "FAILED_WITH_INCIDENT" => Self::FailedWithIncident,
+            "DISCONNECTED" => Self::Disconnected,
+            "RESUMING_WAREHOUSE" => Self::ResumingWarehouse,
+            // gosnowflake spells this `QUEUED_REPARING_WAREHOUSE` (their
+            // typo, on the wire); preserve the exact string match.
+            "QUEUED_REPARING_WAREHOUSE" => Self::QueueRepairingWarehouse,
+            "RESTARTED" => Self::Restarted,
+            "BLOCKED" => Self::Blocked,
+            "NO_DATA" => Self::NoData,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
 pub enum QueryData {
     Arrow(Vec<RecordBatch>),
     Json(JsonResult),
@@ -268,6 +354,59 @@ fn build_arrow_chunk_stream(
         .buffered(DEFAULT_PREFETCH_CHUNKS);
 
     inline.chain(external).boxed()
+}
+
+fn monitoring_status(resp: &MonitoringResponse) -> QueryStatus {
+    resp.data
+        .queries
+        .first()
+        .map_or(QueryStatus::NoData, |q| QueryStatus::from_wire(&q.status))
+}
+
+/// Pull `QueryMetadata` and a normalized body out of a successful query
+/// response. Shared by the live exec path (`resolve_arrow_query`) and the
+/// fetch-by-id path (`resolve_fetch_by_id`); they only differ in how the
+/// response was obtained.
+fn metadata_and_body_from(
+    data: QueryExecResponseData,
+) -> Result<(QueryMetadata, ResolvedArrowResult), SnowflakeApiError> {
+    let inline_present = data.rowset_base64.as_ref().is_some_and(|s| !s.is_empty());
+    let total_chunks = Some(data.chunks.len() + usize::from(inline_present));
+
+    let metadata = QueryMetadata {
+        query_id: data.query_id,
+        total_rows: Some(data.total),
+        total_chunks,
+        statement_type_id: Some(data.statement_type_id),
+        warehouse: data.final_warehouse_name,
+        database: data.final_database_name,
+        schema: data.final_schema_name,
+        role: Some(data.final_role_name),
+    };
+
+    let body = if data.returned == 0 {
+        ResolvedArrowResult::Empty
+    } else if let Some(value) = data.rowset {
+        // JSON for SELECT only happens when the session is configured for it
+        // (debugging path); the default for SELECT is Arrow.
+        ResolvedArrowResult::Json(JsonResult {
+            value,
+            schema: data.rowtype.into_iter().map(Into::into).collect(),
+        })
+    } else if let Some(base64) = data.rowset_base64 {
+        ResolvedArrowResult::Chunked {
+            inline_base64: if base64.is_empty() {
+                None
+            } else {
+                Some(base64)
+            },
+            chunks: data.chunks,
+            chunk_headers: data.chunk_headers,
+        }
+    } else {
+        return Err(SnowflakeApiError::BrokenResponse);
+    };
+    Ok((metadata, body))
 }
 
 fn build_record_batch_stream(raw: ArrowChunkStream) -> RecordBatchStream {
@@ -889,7 +1028,18 @@ impl SnowflakeApi {
         let (metadata, body) = self
             .resolve_arrow_query(sql, request_id, binds, cancel)
             .await?;
-        let data = match body {
+        let data = self.collect_chunks(body).await?;
+        Ok(RawQueryResult { metadata, data })
+    }
+
+    /// Materialize all chunks into in-memory bytes, preserving Snowflake's
+    /// intended order (inline first page, then external chunks). Shared by
+    /// the live-exec and fetch-by-id paths.
+    async fn collect_chunks(
+        &self,
+        body: ResolvedArrowResult,
+    ) -> Result<RawQueryData, SnowflakeApiError> {
+        Ok(match body {
             ResolvedArrowResult::Empty => RawQueryData::Empty,
             ResolvedArrowResult::Json(j) => RawQueryData::Json(j),
             ResolvedArrowResult::Chunked {
@@ -916,8 +1066,7 @@ impl SnowflakeApi {
 
                 RawQueryData::Bytes(bytes)
             }
-        };
-        Ok(RawQueryResult { metadata, data })
+        })
     }
 
     async fn resolve_arrow_query(
@@ -936,7 +1085,7 @@ impl SnowflakeApi {
         let mut resp = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
-            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds, false) => r?,
+            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds, false, false) => r?,
         };
         log::debug!("Got query response: {resp:?}");
 
@@ -967,57 +1116,220 @@ impl SnowflakeApi {
             )),
         }?;
 
-        // Metadata is captured before resp.data is moved into the body
-        // variants below.
-        let total_rows = Some(resp.data.total);
-        let statement_type_id = Some(resp.data.statement_type_id);
-        let warehouse = resp.data.final_warehouse_name.clone();
-        let database = resp.data.final_database_name.clone();
-        let schema = resp.data.final_schema_name.clone();
-        let role = Some(resp.data.final_role_name.clone());
-        let query_id = resp.data.query_id.clone();
+        metadata_and_body_from(resp.data)
+    }
 
-        let inline_present = resp
-            .data
-            .rowset_base64
-            .as_ref()
-            .is_some_and(|s| !s.is_empty());
-        let total_chunks = Some(resp.data.chunks.len() + usize::from(inline_present));
+    /// Submit a query without waiting for results. Returns immediately with
+    /// a [`QueryHandle`] carrying both `request_id` (for [`Self::cancel_query`])
+    /// and `query_id` (for [`Self::query_status`] / [`Self::fetch_results`]).
+    /// Equivalent to gosnowflake's `WithAsyncMode(true)`.
+    ///
+    /// Useful for the three-handler dashboard pattern: one process submits,
+    /// another polls, a third fetches the rows after the original HTTP
+    /// request has long since closed.
+    pub async fn submit_async(&self, sql: &str) -> Result<QueryHandle, SnowflakeApiError> {
+        let cancel = CancellationToken::new();
+        self.submit_async_inner(sql, None, &[], &cancel).await
+    }
 
-        let metadata = QueryMetadata {
-            query_id,
-            total_rows,
-            total_chunks,
-            statement_type_id,
-            warehouse,
-            database,
-            schema,
-            role,
+    async fn submit_async_inner(
+        &self,
+        sql: &str,
+        request_id: Option<Uuid>,
+        binds: &[Bind],
+        cancel: &CancellationToken,
+    ) -> Result<QueryHandle, SnowflakeApiError> {
+        if cancel.is_cancelled() {
+            return Err(SnowflakeApiError::QueryCancelled);
+        }
+        let params = RequestParams::or_new(request_id);
+        let resp = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
+            r = self.run_sql_with_params::<ExecResponse>(
+                sql,
+                QueryType::ArrowQuery,
+                params,
+                binds,
+                false,
+                true,
+            ) => r?,
         };
-
-        let body = if resp.data.returned == 0 {
-            ResolvedArrowResult::Empty
-        } else if let Some(value) = resp.data.rowset {
-            // JSON for SELECT only happens when the session is configured for it
-            // (debugging path); the default for SELECT is Arrow.
-            ResolvedArrowResult::Json(JsonResult {
-                value,
-                schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
-            })
-        } else if let Some(base64) = resp.data.rowset_base64 {
-            ResolvedArrowResult::Chunked {
-                inline_base64: if base64.is_empty() {
-                    None
-                } else {
-                    Some(base64)
-                },
-                chunks: resp.data.chunks,
-                chunk_headers: resp.data.chunk_headers,
+        let query_id = match resp {
+            ExecResponse::QueryAsync(a) => a.data.query_id,
+            // Fast queries can return a terminal Query body even with
+            // asyncExec=true. Surface the handle and let the caller decide
+            // whether to fetch (it's already executed; another round-trip
+            // hits the cached result).
+            ExecResponse::Query(q) => q.data.query_id,
+            ExecResponse::Error(e) if is_sql_execution_cancelled(e.code.as_ref()) => {
+                return Err(SnowflakeApiError::QueryCancelled);
             }
-        } else {
-            return Err(SnowflakeApiError::BrokenResponse);
+            ExecResponse::Error(e) => {
+                return Err(SnowflakeApiError::ApiError(
+                    e.data.error_code,
+                    e.message.unwrap_or_default(),
+                ));
+            }
+            ExecResponse::PutGet(_) => return Err(SnowflakeApiError::UnexpectedResponse),
         };
-        Ok((metadata, body))
+        Ok(QueryHandle {
+            request_id: params.request_id,
+            query_id,
+        })
+    }
+
+    /// One status round-trip against `/monitoring/queries/<id>`. Does not
+    /// consume warehouse credits or buffer results; safe to call from a
+    /// poll loop. `query_id` typically comes from [`QueryHandle::query_id`]
+    /// or `metadata.query_id` on a previous result.
+    pub async fn query_status(&self, query_id: &str) -> Result<QueryStatus, SnowflakeApiError> {
+        let resp = self.send_status_request(query_id).await?;
+        if !resp.success && is_session_expired(resp.code.as_ref()) {
+            log::debug!("Session expired during query_status; renewing and retrying once");
+            self.session.force_renew().await?;
+            let resp = self.send_status_request(query_id).await?;
+            return Ok(monitoring_status(&resp));
+        }
+        Ok(monitoring_status(&resp))
+    }
+
+    async fn send_status_request(
+        &self,
+        query_id: &str,
+    ) -> Result<MonitoringResponse, SnowflakeApiError> {
+        let parts = self.session.get_token().await?;
+        let resp = self
+            .connection
+            .request::<MonitoringResponse>(
+                QueryType::MonitoringQuery(query_id.to_owned()),
+                &self.account_identifier,
+                &[],
+                Some(&parts.session_token_auth_header),
+                serde_json::Value::Null,
+                None,
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// Fetch decoded results for a previously submitted query by id.
+    /// Blocks until terminal using gosnowflake's fetch-by-id backoff
+    /// (`[1, 1, 2, 3, 4, 8, 10]s`, saturating at 10s).
+    pub async fn fetch_results(&self, query_id: &str) -> Result<QueryResult, SnowflakeApiError> {
+        let raw = self.fetch_results_raw(query_id).await?;
+        Ok(raw.deserialize_arrow()?)
+    }
+
+    /// Raw counterpart to [`Self::fetch_results`]: returns Arrow IPC bytes
+    /// without deserialization (or JSON when the session is configured for
+    /// it). Same blocking + backoff semantics.
+    pub async fn fetch_results_raw(
+        &self,
+        query_id: &str,
+    ) -> Result<RawQueryResult, SnowflakeApiError> {
+        let (metadata, body) = self.resolve_fetch_by_id(query_id).await?;
+        let data = self.collect_chunks(body).await?;
+        Ok(RawQueryResult { metadata, data })
+    }
+
+    /// Stream decoded `RecordBatch`es by query id. Blocks until Snowflake
+    /// hands back a terminal envelope, then drives chunk downloads with
+    /// bounded prefetch. Errors with [`SnowflakeApiError::JsonStreamUnsupported`]
+    /// for JSON responses.
+    pub async fn fetch_results_stream(
+        &self,
+        query_id: &str,
+    ) -> Result<(QueryMetadata, RecordBatchStream), SnowflakeApiError> {
+        let (metadata, raw) = self.fetch_results_stream_raw(query_id).await?;
+        Ok((metadata, build_record_batch_stream(raw)))
+    }
+
+    /// Raw counterpart to [`Self::fetch_results_stream`]: yields Arrow IPC
+    /// blobs in original Snowflake order, suitable for SSE-style forwarding.
+    pub async fn fetch_results_stream_raw(
+        &self,
+        query_id: &str,
+    ) -> Result<(QueryMetadata, ArrowChunkStream), SnowflakeApiError> {
+        let (metadata, body) = self.resolve_fetch_by_id(query_id).await?;
+        let stream = match body {
+            ResolvedArrowResult::Empty => stream::empty().boxed(),
+            ResolvedArrowResult::Json(_) => return Err(SnowflakeApiError::JsonStreamUnsupported),
+            ResolvedArrowResult::Chunked {
+                inline_base64,
+                chunks,
+                chunk_headers,
+            } => build_arrow_chunk_stream(
+                Arc::clone(&self.connection),
+                inline_base64,
+                chunks,
+                chunk_headers,
+            ),
+        };
+        Ok((metadata, stream))
+    }
+
+    /// Drive `GET /queries/<id>/result` until terminal. Mirrors
+    /// gosnowflake's `getQueryResultWithRetriesForAsyncMode`: no leading
+    /// sleep on the first call, then `[1, 1, 2, 3, 4, 8, 10]s` (saturating
+    /// at 10s). On `390112` we force-renew once and continue.
+    async fn resolve_fetch_by_id(
+        &self,
+        query_id: &str,
+    ) -> Result<(QueryMetadata, ResolvedArrowResult), SnowflakeApiError> {
+        const FETCH_BY_ID_BACKOFF_S: &[u64] = &[1, 1, 2, 3, 4, 8, 10];
+        let result_path = format!("queries/{query_id}/result");
+        let mut step: usize = 0;
+        let mut renewed = false;
+        let mut first_iter = true;
+
+        loop {
+            if first_iter {
+                first_iter = false;
+            } else {
+                let delay = Duration::from_secs(
+                    FETCH_BY_ID_BACKOFF_S[step.min(FETCH_BY_ID_BACKOFF_S.len() - 1)],
+                );
+                tokio::time::sleep(delay).await;
+                step = step.saturating_add(1);
+            }
+
+            let parts = self.session.get_token().await?;
+            let resp = self
+                .connection
+                .request::<ExecResponse>(
+                    QueryType::ArrowQueryResult(result_path.clone()),
+                    &self.account_identifier,
+                    &[],
+                    Some(&parts.session_token_auth_header),
+                    serde_json::Value::Null,
+                    None,
+                )
+                .await?;
+
+            match resp {
+                ExecResponse::QueryAsync(_) => {}
+                ExecResponse::Query(qr) if is_query_in_progress(qr.code.as_ref()) => {}
+                ExecResponse::Error(e) if is_session_expired(e.code.as_ref()) && !renewed => {
+                    log::info!("Session expired during fetch-by-id; renewing");
+                    self.session.force_renew().await?;
+                    renewed = true;
+                }
+                ExecResponse::Error(e) if is_sql_execution_cancelled(e.code.as_ref()) => {
+                    return Err(SnowflakeApiError::QueryCancelled);
+                }
+                ExecResponse::Error(e) => {
+                    return Err(SnowflakeApiError::ApiError(
+                        e.data.error_code,
+                        e.message.unwrap_or_default(),
+                    ));
+                }
+                ExecResponse::Query(qr) => {
+                    return metadata_and_body_from(qr.data);
+                }
+                ExecResponse::PutGet(_) => return Err(SnowflakeApiError::UnexpectedResponse),
+            }
+        }
     }
 
     /// Cancellation governs setup only; once the stream is returned, dropping
@@ -1059,14 +1371,17 @@ impl SnowflakeApi {
     ) -> Result<(RequestParams, R), SnowflakeApiError> {
         let params = RequestParams::new();
         let resp = self
-            .run_sql_with_params::<R>(sql_text, query_type, params, &[], false)
+            .run_sql_with_params::<R>(sql_text, query_type, params, &[], false, false)
             .await?;
         Ok((params, resp))
     }
 
     /// Run a SQL statement using caller-supplied request params. Used by the
     /// cancellable exec path so the caller controls the `request_id` used
-    /// for both the original query and any later abort POST.
+    /// for both the original query and any later abort POST. `async_exec`
+    /// flips the gosnowflake `WithAsyncMode` toggle: when true, Snowflake
+    /// returns the `query_id` immediately (333334) instead of polling the
+    /// query to completion in this same request.
     async fn run_sql_with_params<R: serde::de::DeserializeOwned>(
         &self,
         sql_text: &str,
@@ -1074,6 +1389,7 @@ impl SnowflakeApi {
         params: RequestParams,
         binds: &[Bind],
         describe_only: bool,
+        async_exec: bool,
     ) -> Result<R, SnowflakeApiError> {
         log::debug!("Executing: {sql_text}");
 
@@ -1095,7 +1411,7 @@ impl SnowflakeApi {
 
         let body = ExecRequest {
             sql_text: sql_text.to_string(),
-            async_exec: false,
+            async_exec,
             sequence_id: parts.sequence_id,
             is_internal: false,
             describe_only,
@@ -1316,6 +1632,33 @@ impl<'a> QueryBuilder<'a> {
             .await
     }
 
+    /// Submit the built query without waiting for results. See
+    /// [`SnowflakeApi::submit_async`] for the deferred-fetch flow this
+    /// enables. Honors `with_cancel` / `cancel_on_drop` for the submit
+    /// POST itself only; the query continues running on Snowflake after
+    /// the future resolves. To abort post-submit, call
+    /// `cancel_query(handle.request_id)` from the same process or
+    /// `SYSTEM$CANCEL_QUERY('<id>')` from any session.
+    pub async fn submit_async(self) -> Result<QueryHandle, SnowflakeApiError> {
+        let owned;
+        let _drop_guard;
+        let cancel = match self.cancel {
+            Cancellation::Borrowed(c) => c,
+            Cancellation::OnDrop(token, guard) => {
+                owned = token;
+                _drop_guard = guard;
+                &owned
+            }
+            Cancellation::None => {
+                owned = CancellationToken::new();
+                &owned
+            }
+        };
+        self.api
+            .submit_async_inner(self.sql, self.request_id, &self.binds, cancel)
+            .await
+    }
+
     /// Validate the query and return the result schema *without executing*.
     /// Snowflake parses + type-checks the SQL (binds included for `?`
     /// placeholder type inference) and returns column metadata only — no
@@ -1334,6 +1677,7 @@ impl<'a> QueryBuilder<'a> {
                 params,
                 &self.binds,
                 true,
+                false,
             )
             .await?;
         match resp {
