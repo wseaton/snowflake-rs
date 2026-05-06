@@ -891,6 +891,7 @@ impl SnowflakeApi {
             binds: Vec::new(),
             cancel: Cancellation::default(),
             request_id: None,
+            parameters: HashMap::new(),
         }
     }
 
@@ -915,7 +916,8 @@ impl SnowflakeApi {
         sql: &str,
         cancel: &CancellationToken,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
-        self.exec_raw_inner(sql, None, &[], cancel).await
+        self.exec_raw_inner(sql, None, &[], cancel, HashMap::new())
+            .await
     }
 
     /// Same as [`SnowflakeApi::exec_with_cancel`], but the caller supplies
@@ -932,7 +934,7 @@ impl SnowflakeApi {
         cancel: &CancellationToken,
     ) -> Result<QueryResult, SnowflakeApiError> {
         let raw = self
-            .exec_raw_inner(sql, Some(request_id), &[], cancel)
+            .exec_raw_inner(sql, Some(request_id), &[], cancel, HashMap::new())
             .await?;
         Ok(raw.deserialize_arrow()?)
     }
@@ -943,6 +945,7 @@ impl SnowflakeApi {
         request_id: Option<Uuid>,
         binds: &[Bind],
         cancel: &CancellationToken,
+        parameters: HashMap<String, serde_json::Value>,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
         let put_re = Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").unwrap();
 
@@ -959,6 +962,13 @@ impl SnowflakeApi {
                     "bind parameters on PUT statements".to_owned(),
                 ));
             }
+            if !parameters.is_empty() {
+                // PUT doesn't accept session-parameter overrides; surface
+                // rather than silently drop them.
+                return Err(SnowflakeApiError::Unimplemented(
+                    "session parameter overrides on PUT statements".to_owned(),
+                ));
+            }
             log::info!("Detected PUT query");
             let metadata = self.exec_put(sql).await?;
             Ok(RawQueryResult {
@@ -966,7 +976,7 @@ impl SnowflakeApi {
                 data: RawQueryData::Empty,
             })
         } else {
-            self.exec_arrow_raw_with_cancel(sql, request_id, binds, cancel)
+            self.exec_arrow_raw_with_cancel(sql, request_id, binds, cancel, parameters)
                 .await
         }
     }
@@ -1032,7 +1042,7 @@ impl SnowflakeApi {
     async fn exec_arrow_raw(&self, sql: &str) -> Result<RawQueryResult, SnowflakeApiError> {
         // Non-cancellable path uses a token that never fires.
         let cancel = CancellationToken::new();
-        self.exec_arrow_raw_with_cancel(sql, None, &[], &cancel)
+        self.exec_arrow_raw_with_cancel(sql, None, &[], &cancel, HashMap::new())
             .await
     }
 
@@ -1042,9 +1052,10 @@ impl SnowflakeApi {
         request_id: Option<Uuid>,
         binds: &[Bind],
         cancel: &CancellationToken,
+        parameters: HashMap<String, serde_json::Value>,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
         let (metadata, body) = self
-            .resolve_arrow_query(sql, request_id, binds, cancel, HashMap::new())
+            .resolve_arrow_query(sql, request_id, binds, cancel, parameters)
             .await?;
         let data = self.collect_chunks(body).await?;
         Ok(RawQueryResult { metadata, data })
@@ -1148,7 +1159,8 @@ impl SnowflakeApi {
     /// request has long since closed.
     pub async fn submit_async(&self, sql: &str) -> Result<QueryHandle, SnowflakeApiError> {
         let cancel = CancellationToken::new();
-        self.submit_async_inner(sql, None, &[], &cancel).await
+        self.submit_async_inner(sql, None, &[], &cancel, HashMap::new())
+            .await
     }
 
     async fn submit_async_inner(
@@ -1157,6 +1169,7 @@ impl SnowflakeApi {
         request_id: Option<Uuid>,
         binds: &[Bind],
         cancel: &CancellationToken,
+        parameters: HashMap<String, serde_json::Value>,
     ) -> Result<QueryHandle, SnowflakeApiError> {
         if cancel.is_cancelled() {
             return Err(SnowflakeApiError::QueryCancelled);
@@ -1172,7 +1185,7 @@ impl SnowflakeApi {
                 binds,
                 false,
                 true,
-                HashMap::new(),
+                parameters,
             ) => r?,
         };
         let query_id = match resp {
@@ -1304,8 +1317,11 @@ impl SnowflakeApi {
         binds: &[Bind],
         cancel: &CancellationToken,
         count: u32,
+        mut parameters: HashMap<String, serde_json::Value>,
     ) -> Result<Vec<QueryResult>, SnowflakeApiError> {
-        let mut parameters = HashMap::new();
+        // execute_multi sets MULTI_STATEMENT_COUNT explicitly; if a caller
+        // pre-set it via with_session_param we'd otherwise silently honor
+        // their value, which is confusing. Overwrite and move on.
         parameters.insert(
             "MULTI_STATEMENT_COUNT".to_owned(),
             serde_json::Value::Number(count.into()),
@@ -1419,9 +1435,10 @@ impl SnowflakeApi {
         request_id: Option<Uuid>,
         binds: &[Bind],
         cancel: &CancellationToken,
+        parameters: HashMap<String, serde_json::Value>,
     ) -> Result<(QueryMetadata, ArrowChunkStream), SnowflakeApiError> {
         let (metadata, body) = self
-            .resolve_arrow_query(sql, request_id, binds, cancel, HashMap::new())
+            .resolve_arrow_query(sql, request_id, binds, cancel, parameters)
             .await?;
         let stream = match body {
             ResolvedArrowResult::Empty => stream::empty().boxed(),
@@ -1597,6 +1614,7 @@ pub struct QueryBuilder<'a> {
     binds: Vec<Bind>,
     cancel: Cancellation<'a>,
     request_id: Option<Uuid>,
+    parameters: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -1653,6 +1671,38 @@ impl<'a> QueryBuilder<'a> {
         self
     }
 
+    /// Override a session parameter for this request only. Equivalent to
+    /// `ALTER SESSION SET <key> = <value>` but request-scoped: does not
+    /// leak to subsequent queries on the same connection. Common keys:
+    /// `TIMEZONE`, `QUERY_TAG`, `WEEK_START`, `USE_CACHED_RESULT`,
+    /// `DATE_OUTPUT_FORMAT`, `BINARY_OUTPUT_FORMAT`, etc. Snowflake
+    /// matches keys case-insensitively; uppercase is canonical.
+    ///
+    /// Same wire mechanism as gosnowflake's `WithStatementContext` / the
+    /// SQL API's `parameters` field.
+    #[must_use]
+    pub fn with_session_param(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.parameters.insert(key.into(), value.into());
+        self
+    }
+
+    /// Bulk variant of [`Self::with_session_param`].
+    #[must_use]
+    pub fn with_session_params<I, K, V>(mut self, params: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<serde_json::Value>,
+    {
+        self.parameters
+            .extend(params.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
     /// Run the query and return Arrow-deserialized results.
     pub async fn execute(self) -> Result<QueryResult, SnowflakeApiError> {
         let raw = self.execute_raw().await?;
@@ -1676,7 +1726,13 @@ impl<'a> QueryBuilder<'a> {
             }
         };
         self.api
-            .exec_raw_inner(self.sql, self.request_id, &self.binds, cancel)
+            .exec_raw_inner(
+                self.sql,
+                self.request_id,
+                &self.binds,
+                cancel,
+                self.parameters,
+            )
             .await
     }
 
@@ -1718,7 +1774,13 @@ impl<'a> QueryBuilder<'a> {
             }
         };
         self.api
-            .exec_arrow_stream(self.sql, self.request_id, &self.binds, cancel)
+            .exec_arrow_stream(
+                self.sql,
+                self.request_id,
+                &self.binds,
+                cancel,
+                self.parameters,
+            )
             .await
     }
 
@@ -1762,7 +1824,14 @@ impl<'a> QueryBuilder<'a> {
             }
         };
         self.api
-            .execute_multi_inner(self.sql, self.request_id, &self.binds, cancel, count)
+            .execute_multi_inner(
+                self.sql,
+                self.request_id,
+                &self.binds,
+                cancel,
+                count,
+                self.parameters,
+            )
             .await
     }
 
@@ -1789,7 +1858,13 @@ impl<'a> QueryBuilder<'a> {
             }
         };
         self.api
-            .submit_async_inner(self.sql, self.request_id, &self.binds, cancel)
+            .submit_async_inner(
+                self.sql,
+                self.request_id,
+                &self.binds,
+                cancel,
+                self.parameters,
+            )
             .await
     }
 
