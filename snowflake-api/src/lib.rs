@@ -31,8 +31,6 @@ use uuid::Uuid;
 // Part of public interface
 pub use arrow_array::RecordBatch;
 pub use arrow_schema::ArrowError;
-pub use tokio_util::sync::CancellationToken as QueryCancellationToken;
-pub use uuid::Uuid as RequestId;
 
 use responses::ExecResponse;
 use session::{AuthError, Session};
@@ -501,7 +499,7 @@ impl SnowflakeApi {
 
     /// Useful for debugging to get the straight query response
     #[cfg(debug_assertions)]
-    pub async fn exec_response(&mut self, sql: &str) -> Result<ExecResponse, SnowflakeApiError> {
+    pub async fn exec_response(&self, sql: &str) -> Result<ExecResponse, SnowflakeApiError> {
         let (_, resp) = self
             .run_sql::<ExecResponse>(sql, QueryType::ArrowQuery)
             .await?;
@@ -510,7 +508,7 @@ impl SnowflakeApi {
 
     /// Useful for debugging to get raw JSON response
     #[cfg(debug_assertions)]
-    pub async fn exec_json(&mut self, sql: &str) -> Result<serde_json::Value, SnowflakeApiError> {
+    pub async fn exec_json(&self, sql: &str) -> Result<serde_json::Value, SnowflakeApiError> {
         let (_, resp) = self
             .run_sql::<serde_json::Value>(sql, QueryType::JsonQuery)
             .await?;
@@ -534,7 +532,7 @@ impl SnowflakeApi {
             api: self,
             sql,
             binds: Vec::new(),
-            cancel: None,
+            cancel: Cancellation::default(),
             request_id: None,
         }
     }
@@ -688,13 +686,7 @@ impl SnowflakeApi {
             return Err(SnowflakeApiError::QueryCancelled);
         }
 
-        let params = match request_id {
-            Some(id) => RequestParams {
-                request_id: id,
-                request_guid: Uuid::new_v4(),
-            },
-            None => RequestParams::new(),
-        };
+        let params = RequestParams::or_new(request_id);
 
         let mut resp = tokio::select! {
             biased;
@@ -838,11 +830,9 @@ impl SnowflakeApi {
     /// Poll the `get_result_url` endpoint until Snowflake returns a final
     /// result (or the caller cancels). The endpoint is allowed to itself
     /// return another `QueryAsync`/in-progress body, so we keep going until
-    /// we see something else.
-    ///
-    /// Backoff schedule mirrors gosnowflake's
-    /// [`getQueryResultWithRetriesForAsyncMode`]: `[500, 500, 1000, 1500,
-    /// 2000, 4000, 5000]ms`, saturating at the last value once exhausted.
+    /// we see something else. Backoff matches gosnowflake's
+    /// `getQueryResultWithRetriesForAsyncMode`: `[500, 500, 1000, 1500,
+    /// 2000, 4000, 5000]ms`, saturating at 5s.
     async fn poll_async_result(
         &self,
         get_result_url: &str,
@@ -851,11 +841,9 @@ impl SnowflakeApi {
     ) -> Result<ExecResponse, SnowflakeApiError> {
         const BACKOFF_MS: &[u64] = &[500, 500, 1000, 1500, 2000, 4000, 5000];
         let mut step: usize = 0;
+        let mut renewed = false;
 
         loop {
-            // Sleep first (snowflake just told us "still in progress"), but
-            // bail immediately on cancel. `tokio::select!` with `biased`
-            // ensures cancellation wins races.
             let delay = Duration::from_millis(BACKOFF_MS[step.min(BACKOFF_MS.len() - 1)]);
             tokio::select! {
                 biased;
@@ -874,19 +862,18 @@ impl SnowflakeApi {
                     &[],
                     Some(&parts.session_token_auth_header),
                     serde_json::Value::Null,
-                    // Each poll gets fresh request_id/request_guid in URL params;
-                    // the original query's request_id is kept for cancellation.
                     None,
                 ) => r?,
             };
 
-            // Either we got a final response, or another in-progress signal.
-            // gosnowflake distinguishes 333333 vs 333334 explicitly, so we
-            // also fall through to "keep polling" if the typed response is
-            // a normal `Query` but its `code` says still-in-progress (defensive).
             match &resp {
                 ExecResponse::QueryAsync(_) => {}
                 ExecResponse::Query(qr) if is_query_in_progress(qr.code.as_ref()) => {}
+                ExecResponse::Error(e) if is_session_expired(e.code.as_ref()) && !renewed => {
+                    log::info!("Session expired mid-poll; renewing and retrying");
+                    self.session.force_renew().await?;
+                    renewed = true;
+                }
                 _ => return Ok(resp),
             }
         }
@@ -912,8 +899,16 @@ pub struct QueryBuilder<'a> {
     api: &'a SnowflakeApi,
     sql: &'a str,
     binds: Vec<Bind>,
-    cancel: Option<&'a CancellationToken>,
+    cancel: Cancellation<'a>,
     request_id: Option<Uuid>,
+}
+
+#[derive(Default)]
+enum Cancellation<'a> {
+    #[default]
+    None,
+    Borrowed(&'a CancellationToken),
+    OnDrop(CancellationToken, tokio_util::sync::DropGuard),
 }
 
 impl<'a> QueryBuilder<'a> {
@@ -940,7 +935,17 @@ impl<'a> QueryBuilder<'a> {
     /// [`SnowflakeApi::exec_with_cancel`] for the semantics.
     #[must_use]
     pub fn with_cancel(mut self, cancel: &'a CancellationToken) -> Self {
-        self.cancel = Some(cancel);
+        self.cancel = Cancellation::Borrowed(cancel);
+        self
+    }
+
+    /// Abort the query on Snowflake if the future returned by `execute()`
+    /// / `execute_raw()` is dropped before completion.
+    #[must_use]
+    pub fn cancel_on_drop(mut self) -> Self {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+        self.cancel = Cancellation::OnDrop(token, guard);
         self
     }
 
@@ -960,14 +965,19 @@ impl<'a> QueryBuilder<'a> {
 
     /// Run the query and return the raw response (Arrow IPC bytes or JSON).
     pub async fn execute_raw(self) -> Result<RawQueryResult, SnowflakeApiError> {
-        // If the caller didn't supply a token, use one that never fires so
-        // the inner select! still has something to await on.
-        let owned_cancel;
-        let cancel = if let Some(c) = self.cancel {
-            c
-        } else {
-            owned_cancel = CancellationToken::new();
-            &owned_cancel
+        let owned;
+        let _drop_guard;
+        let cancel = match self.cancel {
+            Cancellation::Borrowed(c) => c,
+            Cancellation::OnDrop(token, guard) => {
+                owned = token;
+                _drop_guard = guard;
+                &owned
+            }
+            Cancellation::None => {
+                owned = CancellationToken::new();
+                &owned
+            }
         };
         self.api
             .exec_raw_inner(self.sql, self.request_id, &self.binds, cancel)
