@@ -16,7 +16,7 @@ clippy::missing_panics_doc
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arrow_ipc::reader::StreamReader;
@@ -401,6 +401,14 @@ pub type RecordBatchStream = BoxStream<'static, Result<RecordBatch, SnowflakeApi
 /// JDBC defaults. Caps in-flight downloads while preserving order via
 /// `StreamExt::buffered`.
 const DEFAULT_PREFETCH_CHUNKS: usize = 4;
+
+/// Recognizes a leading `PUT` statement (case-insensitive, optionally
+/// preceded by block comments). Compiled once on first use; PUT detection
+/// runs on every `exec_raw` call so amortizing the compile is meaningful.
+fn put_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").expect("static regex compiles"))
+}
 
 enum ResolvedArrowResult {
     Empty,
@@ -889,10 +897,8 @@ impl SnowflakeApi {
     /// If statement is PUT, then file will be uploaded to the Snowflake-managed storage
     /// Returns raw bytes in the Arrow response
     pub async fn exec_raw(&self, sql: &str) -> Result<RawQueryResult, SnowflakeApiError> {
-        let put_re = Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").unwrap();
-
         // put commands go through a different flow and result is side-effect
-        if put_re.is_match(sql) {
+        if put_regex().is_match(sql) {
             log::info!("Detected PUT query");
             let metadata = self.exec_put(sql).await?;
             Ok(RawQueryResult {
@@ -1029,9 +1035,7 @@ impl SnowflakeApi {
         cancel: &CancellationToken,
         parameters: HashMap<String, serde_json::Value>,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
-        let put_re = Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").unwrap();
-
-        if put_re.is_match(sql) {
+        if put_regex().is_match(sql) {
             // PUT goes through a different non-cancellable flow today. The
             // caller's token can still be respected before the upload starts;
             // once we're streaming to S3 we don't currently abort. PUT
