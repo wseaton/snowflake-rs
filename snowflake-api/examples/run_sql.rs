@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let mut api = match (&args.private_key, &args.password) {
+    let api = match (&args.private_key, &args.password) {
         (Some(pkey), None) => {
             let pem = fs::read_to_string(pkey)?;
             SnowflakeApi::with_certificate_auth(
