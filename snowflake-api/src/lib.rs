@@ -691,7 +691,7 @@ impl SnowflakeApi {
         let mut resp = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
-            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds) => r?,
+            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds, false) => r?,
         };
         log::debug!("Got query response: {resp:?}");
 
@@ -771,7 +771,7 @@ impl SnowflakeApi {
     ) -> Result<(RequestParams, R), SnowflakeApiError> {
         let params = RequestParams::new();
         let resp = self
-            .run_sql_with_params::<R>(sql_text, query_type, params, &[])
+            .run_sql_with_params::<R>(sql_text, query_type, params, &[], false)
             .await?;
         Ok((params, resp))
     }
@@ -785,6 +785,7 @@ impl SnowflakeApi {
         query_type: QueryType,
         params: RequestParams,
         binds: &[Bind],
+        describe_only: bool,
     ) -> Result<R, SnowflakeApiError> {
         log::debug!("Executing: {sql_text}");
 
@@ -809,6 +810,7 @@ impl SnowflakeApi {
             async_exec: false,
             sequence_id: parts.sequence_id,
             is_internal: false,
+            describe_only,
             bindings,
         };
 
@@ -982,5 +984,37 @@ impl<'a> QueryBuilder<'a> {
         self.api
             .exec_raw_inner(self.sql, self.request_id, &self.binds, cancel)
             .await
+    }
+
+    /// Validate the query and return the result schema *without executing*.
+    /// Snowflake parses + type-checks the SQL (binds included for `?`
+    /// placeholder type inference) and returns column metadata only — no
+    /// warehouse compute is consumed and no rows are produced. Useful for
+    /// codegen, dynamic UI, and pre-flight validation.
+    ///
+    /// `cancel` and `request_id` settings are honored but rarely matter
+    /// here: describe is a single fast round-trip with no async polling.
+    pub async fn describe(self) -> Result<Vec<FieldSchema>, SnowflakeApiError> {
+        let params = RequestParams::or_new(self.request_id);
+        let resp = self
+            .api
+            .run_sql_with_params::<ExecResponse>(
+                self.sql,
+                QueryType::JsonQuery,
+                params,
+                &self.binds,
+                true,
+            )
+            .await?;
+        match resp {
+            ExecResponse::Query(qr) => Ok(qr.data.rowtype.into_iter().map(Into::into).collect()),
+            ExecResponse::Error(e) => Err(SnowflakeApiError::ApiError(
+                e.data.error_code,
+                e.message.unwrap_or_default(),
+            )),
+            ExecResponse::QueryAsync(_) | ExecResponse::PutGet(_) => {
+                Err(SnowflakeApiError::UnexpectedResponse)
+            }
+        }
     }
 }
