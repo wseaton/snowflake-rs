@@ -510,9 +510,17 @@ impl Session {
             },
             client_environment: ClientEnvironment {
                 application: "Rust".to_string(),
-                // todo: detect os
-                os: "darwin".to_string(),
-                os_version: "gc-arm64".to_string(),
+                // gosnowflake reports `runtime.GOOS` (lowercase: darwin /
+                // linux / windows). Rust's std::env::consts::OS matches
+                // except macOS reports as "macos"; remap.
+                os: match std::env::consts::OS {
+                    "macos" => "darwin".to_owned(),
+                    other => other.to_owned(),
+                },
+                // gosnowflake's `os_version` carries the runtime arch
+                // (the prior hardcoded "gc-arm64" was a stale Go-runtime
+                // tag). Use Rust's target arch: x86_64 / aarch64 / etc.
+                os_version: std::env::consts::ARCH.to_owned(),
                 ocsp_mode: "FAIL_OPEN".to_string(),
             },
         }
