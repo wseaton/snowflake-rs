@@ -32,6 +32,8 @@ use uuid::Uuid;
 pub use arrow_array::RecordBatch;
 pub use arrow_schema::ArrowError;
 
+pub use crate::responses::SnowflakeType;
+
 use responses::ExecResponse;
 use session::{AuthError, Session};
 
@@ -42,7 +44,7 @@ pub use crate::requests::Bind;
 use crate::requests::{AbortRequest, ExecRequest};
 use crate::responses::{
     is_query_in_progress, is_query_not_executing, is_session_expired, is_sql_execution_cancelled,
-    CancelQueryResponse, ExecResponseRowType, SnowflakeType,
+    CancelQueryResponse, ExecResponseRowType,
 };
 use crate::session::AuthError::MissingEnvArgument;
 
