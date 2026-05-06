@@ -6,9 +6,42 @@ use serde::Deserialize;
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub enum ExecResponse {
+    // QueryAsync must come before Query: a 333334 in-progress body only contains
+    // {queryId, getResultUrl, ...}, which is a strict subset of the fields
+    // QueryExecResponseData allows via Option<>, so untagged would otherwise
+    // greedily match the wrong arm.
+    QueryAsync(QueryAsyncExecResponse),
     Query(QueryExecResponse),
     PutGet(PutGetExecResponse),
     Error(ExecErrorResponse),
+}
+
+/// True for both `333333` (queryInProgressCode) and `333334`
+/// (queryInProgressAsyncCode). gosnowflake distinguishes them; both indicate
+/// the result is not ready and we should keep polling.
+pub fn is_query_in_progress(code: Option<&String>) -> bool {
+    matches!(code.map(String::as_str), Some("333333" | "333334"))
+}
+
+/// `390112` — gosnowflake's `sessionExpiredCode`. Returned mid-flight when
+/// the session token has expired; the caller should renew and retry.
+pub fn is_session_expired(code: Option<&String>) -> bool {
+    matches!(code.map(String::as_str), Some("390112"))
+}
+
+/// `000605` — gosnowflake's `queryNotExecutingCode`. Returned by the abort
+/// endpoint when there is no in-flight query to cancel (for example, the
+/// query already finished). Treat as success.
+pub fn is_query_not_executing(code: Option<&String>) -> bool {
+    matches!(code.map(String::as_str), Some("000605"))
+}
+
+/// `000604` — Snowflake's "SQL execution canceled" code. The original
+/// query's polling/initial-POST request observes this *after* an abort
+/// has been sent (typically from a different task or endpoint), so we
+/// can map it to a clean `QueryCancelled` instead of a generic API error.
+pub fn is_sql_execution_cancelled(code: Option<&String>) -> bool {
+    matches!(code.map(String::as_str), Some("000604"))
 }
 
 // todo: add close session response, which should be just empty?
@@ -35,7 +68,12 @@ pub struct BaseRestResponse<D> {
 
 pub type PutGetExecResponse = BaseRestResponse<PutGetResponseData>;
 pub type QueryExecResponse = BaseRestResponse<QueryExecResponseData>;
+pub type QueryAsyncExecResponse = BaseRestResponse<QueryAsyncExecResponseData>;
 pub type ExecErrorResponse = BaseRestResponse<ExecErrorResponseData>;
+/// Response from `/queries/v1/abort-request`. Snowflake returns `data: null`
+/// (or sometimes a sparse object); we keep it as a free-form Value so the
+/// parser doesn't choke.
+pub type CancelQueryResponse = BaseRestResponse<serde_json::Value>;
 pub type AuthErrorResponse = BaseRestResponse<AuthErrorResponseData>;
 pub type AuthenticatorResponse = BaseRestResponse<AuthenticatorResponseData>;
 pub type LoginResponse = BaseRestResponse<LoginResponseData>;
@@ -48,15 +86,27 @@ pub type CloseSessionResponse = BaseRestResponse<Option<()>>;
 pub struct ExecErrorResponseData {
     pub age: i64,
     pub error_code: String,
-    pub internal_error: bool,
+    // Optional because the post-abort error response (code 000604 "SQL
+    // execution canceled") omits this field.
+    pub internal_error: Option<bool>,
 
     // come when query is invalid
     pub line: Option<i64>,
     pub pos: Option<i64>,
 
-    // fixme: only valid for exec query response error? present in any exec query response?
+    // Optional because the abort-request error response and some session
+    // errors omit these. Per spiceai-1.1.
+    pub query_id: Option<String>,
+    pub sql_state: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryAsyncExecResponseData {
     pub query_id: String,
-    pub sql_state: String,
+    pub get_result_url: String,
+    pub query_aborts_after_secs: Option<i64>,
+    pub progress_desc: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]

@@ -59,6 +59,7 @@ open = { version = "5", optional = true }
 glob = { version = "0.3" }
 object_store = { version = "0.13", features = ["aws"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-util = { version = "0.7", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"
