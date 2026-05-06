@@ -9,6 +9,11 @@ pub struct ExecRequest {
     pub async_exec: bool,
     pub sequence_id: u64,
     pub is_internal: bool,
+    /// When true, Snowflake parses + validates + returns schema metadata
+    /// without executing. Skipped from the wire when false to keep normal
+    /// requests untouched.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub describe_only: bool,
     /// Positional bindings for `?` placeholders. Keys are 1-indexed string
     /// positions ("1", "2", ...) per Snowflake's internal API. `None` is
     /// serialized as omitted so unbound queries don't send the field at all.
