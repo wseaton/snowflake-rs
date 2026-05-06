@@ -34,11 +34,8 @@ async fn main() -> Result<()> {
     let cancel_clone = cancel.clone();
     let api_clone = Arc::clone(&api);
 
-    let handle = tokio::spawn(async move {
-        api_clone
-            .exec_with_cancel(SLOW_QUERY, &cancel_clone)
-            .await
-    });
+    let handle =
+        tokio::spawn(async move { api_clone.exec_with_cancel(SLOW_QUERY, &cancel_clone).await });
 
     log::info!("Query started; cancelling in {cancel_after_secs}s");
     tokio::time::sleep(Duration::from_secs(cancel_after_secs)).await;
