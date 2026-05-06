@@ -1,7 +1,9 @@
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
+use reqwest::Method;
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -29,8 +31,9 @@ pub enum ConnectionError {
 /// Container for query parameters
 /// This API has different endpoints and MIME types for different requests
 struct QueryContext {
-    path: &'static str,
+    path: Cow<'static, str>,
     accept_mime: &'static str,
+    method: Method,
 }
 
 pub enum QueryType {
@@ -40,36 +43,87 @@ pub enum QueryType {
     CloseSession,
     JsonQuery,
     ArrowQuery,
+    /// GET /queries/<id>/result. Used to poll the result of a query that
+    /// Snowflake decided to run async (response code 333334). The contained
+    /// path is the `getResultUrl` from the original async response.
+    ArrowQueryResult(String),
+    /// POST /queries/v1/abort-request. Cancels an in-flight query identified
+    /// by the original query's `request_id` (carried in the body, not the path).
+    AbortRequest,
 }
 
 impl QueryType {
-    const fn query_context(&self) -> QueryContext {
+    fn query_context(&self) -> QueryContext {
         match self {
             Self::LoginRequest => QueryContext {
-                path: "session/v1/login-request",
+                path: Cow::Borrowed("session/v1/login-request"),
                 accept_mime: "application/json",
+                method: Method::POST,
             },
             Self::AuthenticatorRequest => QueryContext {
-                path: "session/authenticator-request",
+                path: Cow::Borrowed("session/authenticator-request"),
                 accept_mime: "application/json",
+                method: Method::POST,
             },
             Self::TokenRequest => QueryContext {
-                path: "/session/token-request",
+                path: Cow::Borrowed("/session/token-request"),
                 accept_mime: "application/snowflake",
+                method: Method::POST,
             },
             Self::CloseSession => QueryContext {
-                path: "session",
+                path: Cow::Borrowed("session"),
                 accept_mime: "application/snowflake",
+                method: Method::POST,
             },
             Self::JsonQuery => QueryContext {
-                path: "queries/v1/query-request",
+                path: Cow::Borrowed("queries/v1/query-request"),
                 accept_mime: "application/json",
+                method: Method::POST,
             },
             Self::ArrowQuery => QueryContext {
-                path: "queries/v1/query-request",
+                path: Cow::Borrowed("queries/v1/query-request"),
                 accept_mime: "application/snowflake",
+                method: Method::POST,
+            },
+            Self::ArrowQueryResult(get_result_url) => QueryContext {
+                // get_result_url comes back as an absolute path like
+                // `/queries/<id>/result`. Strip the leading slash so it joins
+                // cleanly with our base host URL builder below.
+                path: Cow::Owned(get_result_url.trim_start_matches('/').to_owned()),
+                accept_mime: "application/snowflake",
+                method: Method::GET,
+            },
+            Self::AbortRequest => QueryContext {
+                path: Cow::Borrowed("queries/v1/abort-request"),
+                accept_mime: "application/snowflake",
+                method: Method::POST,
             },
         }
+    }
+}
+
+/// Per-request identifiers that Snowflake uses to correlate retries and
+/// cancellation. We lift these out of `Connection::request` so callers (the
+/// query exec path) can hold onto the `request_id` and later send an abort
+/// referencing it.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestParams {
+    pub request_id: Uuid,
+    pub request_guid: Uuid,
+}
+
+impl RequestParams {
+    pub fn new() -> Self {
+        Self {
+            request_id: Uuid::new_v4(),
+            request_guid: Uuid::new_v4(),
+        }
+    }
+}
+
+impl Default for RequestParams {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -118,7 +172,12 @@ impl Connection {
             .with(RetryTransientMiddleware::new_with_policy(retry_policy)))
     }
 
-    /// Perform request of given query type with extra body or parameters
+    /// Perform request of given query type with extra body or parameters.
+    ///
+    /// `params` carries the `requestId` and `request_guid` URL params. Callers
+    /// that may later need to cancel (the query exec path) should generate
+    /// these via `RequestParams::new()` and hold the `request_id`. Callers
+    /// that don't care can pass `None` and we'll generate fresh ids per call.
     // todo: implement soft error handling
     // todo: is there better way to not repeat myself?
     pub async fn request<R: serde::de::DeserializeOwned>(
@@ -128,19 +187,18 @@ impl Connection {
         extra_get_params: &[(&str, &str)],
         auth: Option<&str>,
         body: impl serde::Serialize,
+        params: Option<RequestParams>,
     ) -> Result<R, ConnectionError> {
         let context = query_type.query_context();
 
-        let request_id = Uuid::new_v4();
-        let request_guid = Uuid::new_v4();
+        let params = params.unwrap_or_default();
         let client_start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs()
             .to_string();
-        // fixme: update uuid's on the retry
-        let request_id = request_id.to_string();
-        let request_guid = request_guid.to_string();
+        let request_id = params.request_id.to_string();
+        let request_guid = params.request_guid.to_string();
 
         let mut get_params = vec![
             ("clientStartTime", client_start_time.as_str()),
@@ -156,7 +214,6 @@ impl Connection {
         let url = Url::parse_with_params(&url, get_params)?;
 
         let mut headers = HeaderMap::new();
-
         headers.append(
             header::ACCEPT,
             HeaderValue::from_static(context.accept_mime),
@@ -168,15 +225,32 @@ impl Connection {
         }
 
         // todo: persist client to use connection polling
-        let resp = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = match context.method {
+            Method::GET => self.client.get(url).headers(headers).send().await?,
+            // POST is the default; treat anything else as POST since we don't
+            // currently model PUT/DELETE/etc on this internal endpoint.
+            _ => {
+                self.client
+                    .post(url)
+                    .headers(headers)
+                    .json(&body)
+                    .send()
+                    .await?
+            }
+        };
 
-        Ok(resp.json().await?)
+        let bytes = resp.bytes().await?;
+        match serde_json::from_slice::<R>(&bytes) {
+            Ok(parsed) => Ok(parsed),
+            Err(e) => {
+                log::debug!(
+                    "Failed to deserialize response body: {} | body: {}",
+                    e,
+                    String::from_utf8_lossy(&bytes)
+                );
+                Err(e.into())
+            }
+        }
     }
 
     pub async fn get_chunk(

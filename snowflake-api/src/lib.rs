@@ -16,6 +16,7 @@ clippy::missing_panics_doc
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_ipc::reader::StreamReader;
 use base64::Engine;
@@ -24,18 +25,25 @@ use futures::future::try_join_all;
 use regex::Regex;
 use reqwest_middleware::ClientWithMiddleware;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 // Part of public interface
 pub use arrow_array::RecordBatch;
 pub use arrow_schema::ArrowError;
+pub use tokio_util::sync::CancellationToken as QueryCancellationToken;
+pub use uuid::Uuid as RequestId;
 
 use responses::ExecResponse;
 use session::{AuthError, Session};
 
 use crate::connection::QueryType;
-use crate::connection::{Connection, ConnectionError};
-use crate::requests::ExecRequest;
-use crate::responses::{ExecResponseRowType, SnowflakeType};
+use crate::connection::{Connection, ConnectionError, RequestParams};
+use crate::requests::{AbortRequest, ExecRequest};
+use crate::responses::{
+    is_query_in_progress, is_query_not_executing, is_session_expired, is_sql_execution_cancelled,
+    CancelQueryResponse, ExecResponseRowType, SnowflakeType,
+};
 use crate::session::AuthError::MissingEnvArgument;
 
 #[cfg(feature = "browser-auth")]
@@ -94,6 +102,9 @@ pub enum SnowflakeApiError {
 
     #[error("Unexpected API response")]
     UnexpectedResponse,
+
+    #[error("Query was cancelled by the caller")]
+    QueryCancelled,
 
     #[error(transparent)]
     GlobPatternError(#[from] glob::PatternError),
@@ -469,13 +480,15 @@ impl SnowflakeApi {
     }
 
     async fn exec_put(&self, sql: &str) -> Result<(), SnowflakeApiError> {
-        let resp = self
+        let (_, resp) = self
             .run_sql::<ExecResponse>(sql, QueryType::JsonQuery)
             .await?;
         log::debug!("Got PUT response: {resp:?}");
 
         match resp {
-            ExecResponse::Query(_) => Err(SnowflakeApiError::UnexpectedResponse),
+            ExecResponse::Query(_) | ExecResponse::QueryAsync(_) => {
+                Err(SnowflakeApiError::UnexpectedResponse)
+            }
             ExecResponse::PutGet(pg) => put::put(pg).await,
             ExecResponse::Error(e) => Err(SnowflakeApiError::ApiError(
                 e.data.error_code,
@@ -487,27 +500,198 @@ impl SnowflakeApi {
     /// Useful for debugging to get the straight query response
     #[cfg(debug_assertions)]
     pub async fn exec_response(&mut self, sql: &str) -> Result<ExecResponse, SnowflakeApiError> {
-        self.run_sql::<ExecResponse>(sql, QueryType::ArrowQuery)
-            .await
+        let (_, resp) = self
+            .run_sql::<ExecResponse>(sql, QueryType::ArrowQuery)
+            .await?;
+        Ok(resp)
     }
 
     /// Useful for debugging to get raw JSON response
     #[cfg(debug_assertions)]
     pub async fn exec_json(&mut self, sql: &str) -> Result<serde_json::Value, SnowflakeApiError> {
-        self.run_sql::<serde_json::Value>(sql, QueryType::JsonQuery)
-            .await
+        let (_, resp) = self
+            .run_sql::<serde_json::Value>(sql, QueryType::JsonQuery)
+            .await?;
+        Ok(resp)
+    }
+
+    /// Execute a query with cooperative cancellation. Cancelling the token
+    /// before completion sends a Snowflake `abort-request` for the query and
+    /// returns `SnowflakeApiError::QueryCancelled`. Useful for REST APIs
+    /// that need to abort Snowflake work when the upstream HTTP request is
+    /// cancelled (wire it via `token.clone().drop_guard()` in your handler).
+    pub async fn exec_with_cancel(
+        &self,
+        sql: &str,
+        cancel: &CancellationToken,
+    ) -> Result<QueryResult, SnowflakeApiError> {
+        let raw = self.exec_raw_with_cancel(sql, cancel).await?;
+        Ok(raw.deserialize_arrow()?)
+    }
+
+    /// Like `exec_raw`, but cooperatively cancellable. See
+    /// [`SnowflakeApi::exec_with_cancel`].
+    pub async fn exec_raw_with_cancel(
+        &self,
+        sql: &str,
+        cancel: &CancellationToken,
+    ) -> Result<RawQueryResult, SnowflakeApiError> {
+        self.exec_raw_inner(sql, None, cancel).await
+    }
+
+    /// Same as [`SnowflakeApi::exec_with_cancel`], but the caller supplies
+    /// the `request_id`. Useful when the cancellation signal lives in a
+    /// completely different code path (e.g., a separate HTTP cancel
+    /// endpoint that looks up an in-flight query by id) and you want to
+    /// pass the id around instead of a `CancellationToken`. The token here
+    /// is still honored if you have one; pass a fresh `CancellationToken`
+    /// if not.
+    pub async fn exec_with_request_id(
+        &self,
+        sql: &str,
+        request_id: Uuid,
+        cancel: &CancellationToken,
+    ) -> Result<QueryResult, SnowflakeApiError> {
+        let raw = self.exec_raw_inner(sql, Some(request_id), cancel).await?;
+        Ok(raw.deserialize_arrow()?)
+    }
+
+    async fn exec_raw_inner(
+        &self,
+        sql: &str,
+        request_id: Option<Uuid>,
+        cancel: &CancellationToken,
+    ) -> Result<RawQueryResult, SnowflakeApiError> {
+        let put_re = Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").unwrap();
+
+        if put_re.is_match(sql) {
+            // PUT goes through a different non-cancellable flow today. The
+            // caller's token can still be respected before the upload starts;
+            // once we're streaming to S3 we don't currently abort.
+            if cancel.is_cancelled() {
+                return Err(SnowflakeApiError::QueryCancelled);
+            }
+            log::info!("Detected PUT query");
+            self.exec_put(sql).await.map(|()| RawQueryResult::Empty)
+        } else {
+            self.exec_arrow_raw_with_cancel(sql, request_id, cancel)
+                .await
+        }
+    }
+
+    /// Cancel a query identified by the `request_id` returned from the
+    /// cancellable exec methods or generated by the caller. Idempotent: if
+    /// the query has already finished, returns `Ok(())` rather than an
+    /// error (matching the Go driver's behavior on `queryNotExecutingCode`).
+    pub async fn cancel_query(&self, request_id: Uuid) -> Result<(), SnowflakeApiError> {
+        log::debug!("Cancelling query with request_id {request_id}");
+
+        // First attempt.
+        let resp = self.send_abort_request(request_id).await?;
+        if resp.success || is_query_not_executing(resp.code.as_ref()) {
+            return Ok(());
+        }
+
+        // If the session expired mid-flight, renew once and retry. We don't
+        // implement gosnowflake's full 5-retry session-renewal loop here;
+        // one retry covers the common case where the cached token aged out
+        // between the original query and the cancel call.
+        if is_session_expired(resp.code.as_ref()) {
+            log::debug!("Session expired during cancel; renewing and retrying once");
+            let _ = self.session.get_token().await?;
+            let resp = self.send_abort_request(request_id).await?;
+            if resp.success || is_query_not_executing(resp.code.as_ref()) {
+                return Ok(());
+            }
+            return Err(SnowflakeApiError::ApiError(
+                resp.code.unwrap_or_default(),
+                resp.message.unwrap_or_default(),
+            ));
+        }
+
+        Err(SnowflakeApiError::ApiError(
+            resp.code.unwrap_or_default(),
+            resp.message.unwrap_or_default(),
+        ))
+    }
+
+    async fn send_abort_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<CancelQueryResponse, SnowflakeApiError> {
+        let parts = self.session.get_token().await?;
+        let resp = self
+            .connection
+            .request::<CancelQueryResponse>(
+                QueryType::AbortRequest,
+                &self.account_identifier,
+                &[],
+                Some(&parts.session_token_auth_header),
+                AbortRequest {
+                    request_id: request_id.to_string(),
+                },
+                // Cancel POST gets its own fresh request_id/request_guid.
+                None,
+            )
+            .await?;
+        Ok(resp)
     }
 
     async fn exec_arrow_raw(&self, sql: &str) -> Result<RawQueryResult, SnowflakeApiError> {
-        let resp = self
-            .run_sql::<ExecResponse>(sql, QueryType::ArrowQuery)
-            .await?;
+        // Non-cancellable path uses a token that never fires.
+        let cancel = CancellationToken::new();
+        self.exec_arrow_raw_with_cancel(sql, None, &cancel).await
+    }
+
+    async fn exec_arrow_raw_with_cancel(
+        &self,
+        sql: &str,
+        request_id: Option<Uuid>,
+        cancel: &CancellationToken,
+    ) -> Result<RawQueryResult, SnowflakeApiError> {
+        if cancel.is_cancelled() {
+            return Err(SnowflakeApiError::QueryCancelled);
+        }
+
+        let params = match request_id {
+            Some(id) => RequestParams {
+                request_id: id,
+                request_guid: Uuid::new_v4(),
+            },
+            None => RequestParams::new(),
+        };
+
+        let mut resp = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
+            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params) => r?,
+        };
         log::debug!("Got query response: {resp:?}");
 
+        // Snowflake returns `333334` with a get_result_url when it decided to
+        // run the query async. Poll until we get a real result or until the
+        // caller cancels. The poll endpoint can itself reply with another
+        // QueryAsync, so we loop, not branch.
+        while let ExecResponse::QueryAsync(async_data) = resp {
+            log::debug!(
+                "Got async exec response, polling {} (request_id={})",
+                async_data.data.get_result_url,
+                params.request_id
+            );
+            resp = self
+                .poll_async_result(&async_data.data.get_result_url, params.request_id, cancel)
+                .await?;
+        }
+
         let resp = match resp {
-            // processable response
             ExecResponse::Query(qr) => Ok(qr),
-            ExecResponse::PutGet(_) => Err(SnowflakeApiError::UnexpectedResponse),
+            // Already drained above, but the compiler still wants the arm.
+            ExecResponse::QueryAsync(_) | ExecResponse::PutGet(_) => {
+                Err(SnowflakeApiError::UnexpectedResponse)
+            }
+            ExecResponse::Error(e) if is_sql_execution_cancelled(e.code.as_ref()) => {
+                Err(SnowflakeApiError::QueryCancelled)
+            }
             ExecResponse::Error(e) => Err(SnowflakeApiError::ApiError(
                 e.data.error_code,
                 e.message.unwrap_or_default(),
@@ -550,10 +734,29 @@ impl SnowflakeApi {
         }
     }
 
+    /// Run a SQL statement, generating fresh request params. Returns both
+    /// the params and the response so callers in the cancellable exec path
+    /// can hold onto `params.request_id` for later abort.
     async fn run_sql<R: serde::de::DeserializeOwned>(
         &self,
         sql_text: &str,
         query_type: QueryType,
+    ) -> Result<(RequestParams, R), SnowflakeApiError> {
+        let params = RequestParams::new();
+        let resp = self
+            .run_sql_with_params::<R>(sql_text, query_type, params)
+            .await?;
+        Ok((params, resp))
+    }
+
+    /// Run a SQL statement using caller-supplied request params. Used by the
+    /// cancellable exec path so the caller controls the `request_id` used
+    /// for both the original query and any later abort POST.
+    async fn run_sql_with_params<R: serde::de::DeserializeOwned>(
+        &self,
+        sql_text: &str,
+        query_type: QueryType,
+        params: RequestParams,
     ) -> Result<R, SnowflakeApiError> {
         log::debug!("Executing: {sql_text}");
 
@@ -574,9 +777,79 @@ impl SnowflakeApi {
                 &[],
                 Some(&parts.session_token_auth_header),
                 body,
+                Some(params),
             )
             .await?;
 
         Ok(resp)
+    }
+
+    /// Poll the `get_result_url` endpoint until Snowflake returns a final
+    /// result (or the caller cancels). The endpoint is allowed to itself
+    /// return another `QueryAsync`/in-progress body, so we keep going until
+    /// we see something else.
+    ///
+    /// Backoff schedule mirrors gosnowflake's
+    /// [`getQueryResultWithRetriesForAsyncMode`]: `[500, 500, 1000, 1500,
+    /// 2000, 4000, 5000]ms`, saturating at the last value once exhausted.
+    async fn poll_async_result(
+        &self,
+        get_result_url: &str,
+        request_id: Uuid,
+        cancel: &CancellationToken,
+    ) -> Result<ExecResponse, SnowflakeApiError> {
+        const BACKOFF_MS: &[u64] = &[500, 500, 1000, 1500, 2000, 4000, 5000];
+        let mut step: usize = 0;
+
+        loop {
+            // Sleep first (snowflake just told us "still in progress"), but
+            // bail immediately on cancel. `tokio::select!` with `biased`
+            // ensures cancellation wins races.
+            let delay = Duration::from_millis(BACKOFF_MS[step.min(BACKOFF_MS.len() - 1)]);
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return self.bail_cancelled(request_id).await,
+                () = tokio::time::sleep(delay) => {}
+            }
+            step = step.saturating_add(1);
+
+            let parts = self.session.get_token().await?;
+            let resp = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return self.bail_cancelled(request_id).await,
+                r = self.connection.request::<ExecResponse>(
+                    QueryType::ArrowQueryResult(get_result_url.to_owned()),
+                    &self.account_identifier,
+                    &[],
+                    Some(&parts.session_token_auth_header),
+                    serde_json::Value::Null,
+                    // Each poll gets fresh request_id/request_guid in URL params;
+                    // the original query's request_id is kept for cancellation.
+                    None,
+                ) => r?,
+            };
+
+            // Either we got a final response, or another in-progress signal.
+            // gosnowflake distinguishes 333333 vs 333334 explicitly, so we
+            // also fall through to "keep polling" if the typed response is
+            // a normal `Query` but its `code` says still-in-progress (defensive).
+            match &resp {
+                ExecResponse::QueryAsync(_) => {}
+                ExecResponse::Query(qr) if is_query_in_progress(qr.code.as_ref()) => {}
+                _ => return Ok(resp),
+            }
+        }
+    }
+
+    /// Helper used by the polling loop on cancellation: fire a best-effort
+    /// abort and surface `QueryCancelled` to the caller. We log but do not
+    /// propagate cancel-side errors — the caller's intent was to abandon
+    /// the query, not to learn about the abort endpoint's mood.
+    async fn bail_cancelled(&self, request_id: Uuid) -> Result<ExecResponse, SnowflakeApiError> {
+        log::debug!("Cancellation observed; sending abort for request_id={request_id}");
+        if let Err(e) = self.cancel_query(request_id).await {
+            log::warn!("Best-effort cancel failed for request_id={request_id}: {e}");
+        }
+        Err(SnowflakeApiError::QueryCancelled)
     }
 }

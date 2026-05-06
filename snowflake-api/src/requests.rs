@@ -9,6 +9,16 @@ pub struct ExecRequest {
     pub is_internal: bool,
 }
 
+/// Body for `/queries/v1/abort-request`. The `request_id` is the UUID generated
+/// for the original query POST (the one we want to cancel), serialized as
+/// `requestId`. The cancel POST itself carries its own `request_id`/`request_guid`
+/// in URL params.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AbortRequest {
+    pub request_id: String,
+}
+
 #[derive(Serialize, Debug)]
 pub struct LoginRequest<T> {
     pub data: T,
