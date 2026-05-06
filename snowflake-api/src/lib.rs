@@ -174,8 +174,9 @@ pub struct QueryMetadata {
     /// progress display in dashboards. None for non-streaming responses.
     pub total_chunks: Option<usize>,
     /// Snowflake's internal statement-type code (e.g. `0x1000` SELECT,
-    /// `0x3100` INSERT). Raw integer; gosnowflake's enum mapping isn't
-    /// replicated here yet.
+    /// `0x3100` INSERT). Raw integer; use [`Self::statement_type`] for
+    /// the gosnowflake-named enum mapping if you don't need fine-grained
+    /// codes.
     pub statement_type_id: Option<i64>,
     /// Session context that executed the query. Optional because PUT and
     /// some session-less paths omit them.
@@ -187,6 +188,24 @@ pub struct QueryMetadata {
     /// [`QueryBuilder::execute_multi`] / [`QueryBuilder::execute_multi_exact`]).
     /// Empty for normal single-statement queries.
     pub result_ids: Vec<String>,
+}
+
+impl QueryMetadata {
+    /// Decode [`Self::statement_type_id`] into the gosnowflake-named enum.
+    /// Returns `None` for PUT and any path that didn't carry a code.
+    #[must_use]
+    pub fn statement_type(&self) -> Option<StatementType> {
+        self.statement_type_id.map(StatementType::from_code)
+    }
+
+    /// gosnowflake's `isDql`: a real read query, not a multi-statement
+    /// parent envelope. Useful when iterating rows from a generic result
+    /// handler — DML / DDL / coordinator envelopes have no rows worth
+    /// looking at.
+    #[must_use]
+    pub fn is_dql(&self) -> bool {
+        matches!(self.statement_type(), Some(StatementType::Select)) && self.result_ids.is_empty()
+    }
 }
 
 /// Container for a successful query response: [`QueryMetadata`] + rows.
@@ -279,6 +298,69 @@ impl QueryStatus {
             "BLOCKED" => Self::Blocked,
             "NO_DATA" => Self::NoData,
             other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+/// Decoded `statement_type_id`, mirroring gosnowflake's named constants
+/// (`connection.go` defines exactly these four; everything else is `Other`).
+/// gosnowflake's grouping is intentionally coarse: INSERT / UPDATE / DELETE /
+/// MERGE all map to [`StatementType::Dml`] by way of being inside the
+/// `[0x3000, 0x3500]` range. If you need finer granularity, compare against
+/// the raw [`QueryMetadata::statement_type_id`] integer directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementType {
+    /// `0x1000` (4096). Pure read query.
+    Select,
+    /// `0x3000` (12288). Generic DML: INSERT / UPDATE / DELETE / MERGE.
+    Dml,
+    /// `0x3500` (13568). Multi-table INSERT (the `INSERT ALL` form).
+    MultiTableInsert,
+    /// `0xA000` (40960). Multi-statement parent envelope. Note: gosnowflake
+    /// notes this code can collide with single-INSERT in some server
+    /// responses; when [`QueryMetadata::result_ids`] is non-empty you've
+    /// got a real multi-statement parent.
+    Multistatement,
+    Other(i64),
+}
+
+impl StatementType {
+    pub const SELECT: i64 = 0x1000;
+    pub const DML: i64 = 0x3000;
+    pub const MULTI_TABLE_INSERT: i64 = 0x3500;
+    pub const MULTISTATEMENT: i64 = 0xA000;
+
+    #[must_use]
+    pub fn from_code(v: i64) -> Self {
+        match v {
+            Self::SELECT => Self::Select,
+            Self::DML => Self::Dml,
+            Self::MULTI_TABLE_INSERT => Self::MultiTableInsert,
+            Self::MULTISTATEMENT => Self::Multistatement,
+            other => Self::Other(other),
+        }
+    }
+
+    #[must_use]
+    pub fn code(self) -> i64 {
+        match self {
+            Self::Select => Self::SELECT,
+            Self::Dml => Self::DML,
+            Self::MultiTableInsert => Self::MULTI_TABLE_INSERT,
+            Self::Multistatement => Self::MULTISTATEMENT,
+            Self::Other(v) => v,
+        }
+    }
+
+    /// `true` for any code in gosnowflake's DML range (`[0x3000, 0x3500]`),
+    /// covering `Dml` and `MultiTableInsert` plus any unnamed sub-codes
+    /// that fell through to `Other`.
+    #[must_use]
+    pub fn is_dml(self) -> bool {
+        match self {
+            Self::Dml | Self::MultiTableInsert => true,
+            Self::Other(c) => (Self::DML..=Self::MULTI_TABLE_INSERT).contains(&c),
+            _ => false,
         }
     }
 }
@@ -1925,6 +2007,53 @@ impl<'a> QueryBuilder<'a> {
             ExecResponse::QueryAsync(_) | ExecResponse::PutGet(_) => {
                 Err(SnowflakeApiError::UnexpectedResponse)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatementType;
+
+    #[test]
+    fn statement_type_decodes_named_codes() {
+        assert_eq!(StatementType::from_code(0x1000), StatementType::Select);
+        assert_eq!(StatementType::from_code(0x3000), StatementType::Dml);
+        assert_eq!(
+            StatementType::from_code(0x3500),
+            StatementType::MultiTableInsert
+        );
+        assert_eq!(
+            StatementType::from_code(0xA000),
+            StatementType::Multistatement
+        );
+        // Sub-codes inside the DML range fall through to Other but still
+        // pass is_dml().
+        assert_eq!(
+            StatementType::from_code(0x3100),
+            StatementType::Other(0x3100)
+        );
+    }
+
+    #[test]
+    fn statement_type_is_dml_covers_range() {
+        assert!(StatementType::Dml.is_dml());
+        assert!(StatementType::MultiTableInsert.is_dml());
+        // 0x3100 = INSERT (single), unnamed in gosnowflake but inside the range.
+        assert!(StatementType::from_code(0x3100).is_dml());
+        // Boundary: 0x3500 is the inclusive upper end.
+        assert!(StatementType::from_code(0x3500).is_dml());
+        // 0x3501 is past the range — not DML.
+        assert!(!StatementType::from_code(0x3501).is_dml());
+        // SELECT and Multistatement are not DML.
+        assert!(!StatementType::Select.is_dml());
+        assert!(!StatementType::Multistatement.is_dml());
+    }
+
+    #[test]
+    fn statement_type_code_round_trips() {
+        for c in [0x1000_i64, 0x3000, 0x3500, 0xA000, 0x6000] {
+            assert_eq!(StatementType::from_code(c).code(), c);
         }
     }
 }
