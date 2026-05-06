@@ -52,7 +52,7 @@ polars-io = { version = ">=0.41", features = [
 ], optional = true }
 
 # browser-auth support
-getrandom = { version = "0.3", optional = true }
+getrandom = { version = "0.4", optional = true }
 urlencoding = { version = "2", optional = true }
 open = { version = "5", optional = true }
 
