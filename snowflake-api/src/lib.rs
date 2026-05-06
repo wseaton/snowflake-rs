@@ -13,6 +13,7 @@ clippy::future_not_send, // This one seems like something we should eventually f
 clippy::missing_panics_doc
 )]
 
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use arrow_ipc::reader::StreamReader;
 use base64::Engine;
 use bytes::{Buf, Bytes};
 use futures::future::try_join_all;
+use futures::stream::{self, BoxStream, StreamExt};
 use regex::Regex;
 use reqwest_middleware::ClientWithMiddleware;
 use thiserror::Error;
@@ -108,6 +110,9 @@ pub enum SnowflakeApiError {
     #[error("Query was cancelled by the caller")]
     QueryCancelled,
 
+    #[error("Streaming is only supported for Arrow responses; got JSON. Use execute()/execute_raw() instead.")]
+    JsonStreamUnsupported,
+
     #[error(transparent)]
     GlobPatternError(#[from] glob::PatternError),
 
@@ -171,6 +176,75 @@ pub enum RawQueryResult {
     /// as it's already a part of REST response
     Json(JsonResult),
     Empty,
+}
+
+/// Stream of Arrow IPC blobs, one per Snowflake chunk, in original response
+/// order. Suitable for forwarding through HTTP/SSE without re-encoding.
+pub type ArrowChunkStream = BoxStream<'static, Result<Bytes, SnowflakeApiError>>;
+
+/// Stream of decoded Arrow `RecordBatch`es. A single Snowflake chunk may
+/// contain multiple batches; they are flattened into the stream in order.
+pub type RecordBatchStream = BoxStream<'static, Result<RecordBatch, SnowflakeApiError>>;
+
+/// Matches Snowflake's default `CLIENT_PREFETCH_THREADS` and gosnowflake /
+/// JDBC defaults. Caps in-flight downloads while preserving order via
+/// `StreamExt::buffered`.
+const DEFAULT_PREFETCH_CHUNKS: usize = 4;
+
+enum ResolvedArrowResult {
+    Empty,
+    Json(JsonResult),
+    Chunked {
+        inline_base64: Option<String>,
+        chunks: Vec<crate::responses::ExecResponseChunk>,
+        chunk_headers: HashMap<String, String>,
+    },
+}
+
+fn build_arrow_chunk_stream(
+    connection: Arc<Connection>,
+    inline_base64: Option<String>,
+    chunks: Vec<crate::responses::ExecResponseChunk>,
+    chunk_headers: HashMap<String, String>,
+) -> ArrowChunkStream {
+    let inline = stream::iter(inline_base64.into_iter().map(|b64| {
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map(Bytes::from)
+            .map_err(SnowflakeApiError::from)
+    }));
+
+    let headers = Arc::new(chunk_headers);
+    let external = stream::iter(chunks)
+        .map(move |chunk| {
+            let connection = Arc::clone(&connection);
+            let headers = Arc::clone(&headers);
+            async move {
+                connection
+                    .get_chunk(&chunk.url, &headers)
+                    .await
+                    .map_err(SnowflakeApiError::from)
+            }
+        })
+        .buffered(DEFAULT_PREFETCH_CHUNKS);
+
+    inline.chain(external).boxed()
+}
+
+fn build_record_batch_stream(raw: ArrowChunkStream) -> RecordBatchStream {
+    raw.flat_map(|item| match item {
+        Err(e) => stream::iter(vec![Err(e)]).boxed(),
+        Ok(bytes) => match StreamReader::try_new(bytes.reader(), None) {
+            Err(e) => stream::iter(vec![Err(SnowflakeApiError::from(e))]).boxed(),
+            Ok(reader) => stream::iter(
+                reader
+                    .map(|r| r.map_err(SnowflakeApiError::from))
+                    .collect::<Vec<_>>(),
+            )
+            .boxed(),
+        },
+    })
+    .boxed()
 }
 
 impl RawQueryResult {
@@ -684,6 +758,46 @@ impl SnowflakeApi {
         binds: &[Bind],
         cancel: &CancellationToken,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
+        match self
+            .resolve_arrow_query(sql, request_id, binds, cancel)
+            .await?
+        {
+            ResolvedArrowResult::Empty => Ok(RawQueryResult::Empty),
+            ResolvedArrowResult::Json(j) => Ok(RawQueryResult::Json(j)),
+            ResolvedArrowResult::Chunked {
+                inline_base64,
+                chunks,
+                chunk_headers,
+            } => {
+                // try_join_all preserves input order, which matches Snowflake's
+                // intended chunk ordering (load-bearing for ORDER BY).
+                let mut bytes: Vec<Bytes> = try_join_all(
+                    chunks
+                        .iter()
+                        .map(|chunk| self.connection.get_chunk(&chunk.url, &chunk_headers)),
+                )
+                .await?;
+
+                // Inline base64 is the first page (gosnowflake's `firstBatchRaw`,
+                // index 0); external chunks follow.
+                if let Some(b64) = inline_base64 {
+                    let inline =
+                        Bytes::from(base64::engine::general_purpose::STANDARD.decode(b64)?);
+                    bytes.insert(0, inline);
+                }
+
+                Ok(RawQueryResult::Bytes(bytes))
+            }
+        }
+    }
+
+    async fn resolve_arrow_query(
+        &self,
+        sql: &str,
+        request_id: Option<Uuid>,
+        binds: &[Bind],
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedArrowResult, SnowflakeApiError> {
         if cancel.is_cancelled() {
             return Err(SnowflakeApiError::QueryCancelled);
         }
@@ -697,10 +811,8 @@ impl SnowflakeApi {
         };
         log::debug!("Got query response: {resp:?}");
 
-        // Snowflake returns `333334` with a get_result_url when it decided to
-        // run the query async. Poll until we get a real result or until the
-        // caller cancels. The poll endpoint can itself reply with another
-        // QueryAsync, so we loop, not branch.
+        // QueryAsync (code 333334) can itself return another QueryAsync; loop
+        // until we see a terminal kind.
         while let ExecResponse::QueryAsync(async_data) = resp {
             log::debug!(
                 "Got async exec response, polling {} (request_id={})",
@@ -714,7 +826,6 @@ impl SnowflakeApi {
 
         let resp = match resp {
             ExecResponse::Query(qr) => Ok(qr),
-            // Already drained above, but the compiler still wants the arm.
             ExecResponse::QueryAsync(_) | ExecResponse::PutGet(_) => {
                 Err(SnowflakeApiError::UnexpectedResponse)
             }
@@ -727,39 +838,55 @@ impl SnowflakeApi {
             )),
         }?;
 
-        // if response was empty, base64 data is empty string
-        // todo: still return empty arrow batch with proper schema? (schema always included)
         if resp.data.returned == 0 {
-            log::debug!("Got response with 0 rows");
-            Ok(RawQueryResult::Empty)
+            Ok(ResolvedArrowResult::Empty)
         } else if let Some(value) = resp.data.rowset {
-            log::debug!("Got JSON response");
-            // NOTE: json response could be chunked too. however, go clients should receive arrow by-default,
-            // unless user sets session variable to return json. This case was added for debugging and status
-            // information being passed through that fields.
-            Ok(RawQueryResult::Json(JsonResult {
+            // JSON for SELECT only happens when the session is configured for it
+            // (debugging path); the default for SELECT is Arrow.
+            Ok(ResolvedArrowResult::Json(JsonResult {
                 value,
                 schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
             }))
         } else if let Some(base64) = resp.data.rowset_base64 {
-            // fixme: is it possible to give streaming interface?
-            let mut chunks = try_join_all(resp.data.chunks.iter().map(|chunk| {
-                self.connection
-                    .get_chunk(&chunk.url, &resp.data.chunk_headers)
-            }))
-            .await?;
-
-            // fixme: should base64 chunk go first?
-            // fixme: if response is chunked is it both base64 + chunks or just chunks?
-            if !base64.is_empty() {
-                log::debug!("Got base64 encoded response");
-                let bytes = Bytes::from(base64::engine::general_purpose::STANDARD.decode(base64)?);
-                chunks.push(bytes);
-            }
-
-            Ok(RawQueryResult::Bytes(chunks))
+            Ok(ResolvedArrowResult::Chunked {
+                inline_base64: if base64.is_empty() {
+                    None
+                } else {
+                    Some(base64)
+                },
+                chunks: resp.data.chunks,
+                chunk_headers: resp.data.chunk_headers,
+            })
         } else {
             Err(SnowflakeApiError::BrokenResponse)
+        }
+    }
+
+    /// Cancellation governs setup only; once the stream is returned, dropping
+    /// it aborts any in-flight chunk downloads.
+    async fn exec_arrow_stream(
+        &self,
+        sql: &str,
+        request_id: Option<Uuid>,
+        binds: &[Bind],
+        cancel: &CancellationToken,
+    ) -> Result<ArrowChunkStream, SnowflakeApiError> {
+        match self
+            .resolve_arrow_query(sql, request_id, binds, cancel)
+            .await?
+        {
+            ResolvedArrowResult::Empty => Ok(stream::empty().boxed()),
+            ResolvedArrowResult::Json(_) => Err(SnowflakeApiError::JsonStreamUnsupported),
+            ResolvedArrowResult::Chunked {
+                inline_base64,
+                chunks,
+                chunk_headers,
+            } => Ok(build_arrow_chunk_stream(
+                Arc::clone(&self.connection),
+                inline_base64,
+                chunks,
+                chunk_headers,
+            )),
         }
     }
 
@@ -985,6 +1112,44 @@ impl<'a> QueryBuilder<'a> {
         };
         self.api
             .exec_raw_inner(self.sql, self.request_id, &self.binds, cancel)
+            .await
+    }
+
+    /// Run the query and return a stream of decoded `RecordBatch`es. Chunks
+    /// are downloaded with bounded prefetch (`DEFAULT_PREFETCH_CHUNKS`) and
+    /// yielded in original Snowflake order. The first awaited future
+    /// resolves once Snowflake returns the result envelope (including any
+    /// async polling); the returned stream then drives the chunk downloads.
+    ///
+    /// Errors with [`SnowflakeApiError::JsonStreamUnsupported`] if the
+    /// response is JSON. Returns an empty stream for empty results.
+    pub async fn execute_stream(self) -> Result<RecordBatchStream, SnowflakeApiError> {
+        let raw = self.execute_stream_raw().await?;
+        Ok(build_record_batch_stream(raw))
+    }
+
+    /// Run the query and return a stream of raw Arrow IPC blobs, one per
+    /// Snowflake chunk, in original order. The inline first-page blob is
+    /// yielded as item 0; external chunk downloads follow with bounded
+    /// prefetch. Useful for forwarding Arrow IPC over HTTP/SSE without a
+    /// decode/re-encode round-trip.
+    pub async fn execute_stream_raw(self) -> Result<ArrowChunkStream, SnowflakeApiError> {
+        let owned;
+        let _drop_guard;
+        let cancel = match self.cancel {
+            Cancellation::Borrowed(c) => c,
+            Cancellation::OnDrop(token, guard) => {
+                owned = token;
+                _drop_guard = guard;
+                &owned
+            }
+            Cancellation::None => {
+                owned = CancellationToken::new();
+                &owned
+            }
+        };
+        self.api
+            .exec_arrow_stream(self.sql, self.request_id, &self.binds, cancel)
             .await
     }
 
