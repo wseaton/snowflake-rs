@@ -183,6 +183,10 @@ pub struct QueryMetadata {
     pub database: Option<String>,
     pub schema: Option<String>,
     pub role: Option<String>,
+    /// Child statement query ids for multi-statement parents (returned by
+    /// [`QueryBuilder::execute_multi`] / [`QueryBuilder::execute_multi_exact`]).
+    /// Empty for normal single-statement queries.
+    pub result_ids: Vec<String>,
 }
 
 /// Container for a successful query response: [`QueryMetadata`] + rows.
@@ -373,6 +377,18 @@ fn metadata_and_body_from(
     let inline_present = data.rowset_base64.as_ref().is_some_and(|s| !s.is_empty());
     let total_chunks = Some(data.chunks.len() + usize::from(inline_present));
 
+    let result_ids = data
+        .result_ids
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
     let metadata = QueryMetadata {
         query_id: data.query_id,
         total_rows: Some(data.total),
@@ -382,6 +398,7 @@ fn metadata_and_body_from(
         database: data.final_database_name,
         schema: data.final_schema_name,
         role: Some(data.final_role_name),
+        result_ids,
     };
 
     let body = if data.returned == 0 {
@@ -824,6 +841,7 @@ impl SnowflakeApi {
                     warehouse: None,
                     database: None,
                     schema: None,
+                    result_ids: Vec::new(),
                     role: None,
                 };
                 put::put(pg).await?;
@@ -1026,7 +1044,7 @@ impl SnowflakeApi {
         cancel: &CancellationToken,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
         let (metadata, body) = self
-            .resolve_arrow_query(sql, request_id, binds, cancel)
+            .resolve_arrow_query(sql, request_id, binds, cancel, HashMap::new())
             .await?;
         let data = self.collect_chunks(body).await?;
         Ok(RawQueryResult { metadata, data })
@@ -1075,6 +1093,7 @@ impl SnowflakeApi {
         request_id: Option<Uuid>,
         binds: &[Bind],
         cancel: &CancellationToken,
+        parameters: HashMap<String, serde_json::Value>,
     ) -> Result<(QueryMetadata, ResolvedArrowResult), SnowflakeApiError> {
         if cancel.is_cancelled() {
             return Err(SnowflakeApiError::QueryCancelled);
@@ -1085,7 +1104,7 @@ impl SnowflakeApi {
         let mut resp = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
-            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds, false, false) => r?,
+            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds, false, false, parameters.clone()) => r?,
         };
         log::debug!("Got query response: {resp:?}");
 
@@ -1153,6 +1172,7 @@ impl SnowflakeApi {
                 binds,
                 false,
                 true,
+                HashMap::new(),
             ) => r?,
         };
         let query_id = match resp {
@@ -1228,7 +1248,8 @@ impl SnowflakeApi {
         &self,
         query_id: &str,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
-        let (metadata, body) = self.resolve_fetch_by_id(query_id).await?;
+        let cancel = CancellationToken::new();
+        let (metadata, body) = self.resolve_fetch_by_id(query_id, &cancel).await?;
         let data = self.collect_chunks(body).await?;
         Ok(RawQueryResult { metadata, data })
     }
@@ -1251,7 +1272,8 @@ impl SnowflakeApi {
         &self,
         query_id: &str,
     ) -> Result<(QueryMetadata, ArrowChunkStream), SnowflakeApiError> {
-        let (metadata, body) = self.resolve_fetch_by_id(query_id).await?;
+        let cancel = CancellationToken::new();
+        let (metadata, body) = self.resolve_fetch_by_id(query_id, &cancel).await?;
         let stream = match body {
             ResolvedArrowResult::Empty => stream::empty().boxed(),
             ResolvedArrowResult::Json(_) => return Err(SnowflakeApiError::JsonStreamUnsupported),
@@ -1269,6 +1291,54 @@ impl SnowflakeApi {
         Ok((metadata, stream))
     }
 
+    /// Submit a multi-statement payload and return one [`QueryResult`] per
+    /// child statement, in source order. `count` mirrors gosnowflake's
+    /// `WithMultiStatement`: pass `0` to let Snowflake count, or `N` to
+    /// require an exact match (mismatch errors at submit). When `count == 1`
+    /// (or `count == 0` and the SQL has only one statement), Snowflake
+    /// returns the result inline and we wrap it as a single-element Vec.
+    async fn execute_multi_inner(
+        &self,
+        sql: &str,
+        request_id: Option<Uuid>,
+        binds: &[Bind],
+        cancel: &CancellationToken,
+        count: u32,
+    ) -> Result<Vec<QueryResult>, SnowflakeApiError> {
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "MULTI_STATEMENT_COUNT".to_owned(),
+            serde_json::Value::Number(count.into()),
+        );
+
+        let (parent_metadata, parent_body) = self
+            .resolve_arrow_query(sql, request_id, binds, cancel, parameters)
+            .await?;
+
+        // Single-statement payload: parent envelope IS the result.
+        if parent_metadata.result_ids.is_empty() {
+            let data = self.collect_chunks(parent_body).await?;
+            let raw = RawQueryResult {
+                metadata: parent_metadata,
+                data,
+            };
+            return Ok(vec![raw.deserialize_arrow()?]);
+        }
+
+        // Multi-statement: fan out via the existing fetch-by-id machinery.
+        // Run children in parallel; try_join_all preserves input order.
+        let fetches = parent_metadata
+            .result_ids
+            .iter()
+            .map(|child_id| async move {
+                let (metadata, body) = self.resolve_fetch_by_id(child_id, cancel).await?;
+                let data = self.collect_chunks(body).await?;
+                let raw = RawQueryResult { metadata, data };
+                Ok::<QueryResult, SnowflakeApiError>(raw.deserialize_arrow()?)
+            });
+        try_join_all(fetches).await
+    }
+
     /// Drive `GET /queries/<id>/result` until terminal. Mirrors
     /// gosnowflake's `getQueryResultWithRetriesForAsyncMode`: no leading
     /// sleep on the first call, then `[1, 1, 2, 3, 4, 8, 10]s` (saturating
@@ -1276,6 +1346,7 @@ impl SnowflakeApi {
     async fn resolve_fetch_by_id(
         &self,
         query_id: &str,
+        cancel: &CancellationToken,
     ) -> Result<(QueryMetadata, ResolvedArrowResult), SnowflakeApiError> {
         const FETCH_BY_ID_BACKOFF_S: &[u64] = &[1, 1, 2, 3, 4, 8, 10];
         let result_path = format!("queries/{query_id}/result");
@@ -1284,28 +1355,36 @@ impl SnowflakeApi {
         let mut first_iter = true;
 
         loop {
+            if cancel.is_cancelled() {
+                return Err(SnowflakeApiError::QueryCancelled);
+            }
             if first_iter {
                 first_iter = false;
             } else {
                 let delay = Duration::from_secs(
                     FETCH_BY_ID_BACKOFF_S[step.min(FETCH_BY_ID_BACKOFF_S.len() - 1)],
                 );
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
+                    () = tokio::time::sleep(delay) => {}
+                }
                 step = step.saturating_add(1);
             }
 
             let parts = self.session.get_token().await?;
-            let resp = self
-                .connection
-                .request::<ExecResponse>(
+            let resp = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
+                r = self.connection.request::<ExecResponse>(
                     QueryType::ArrowQueryResult(result_path.clone()),
                     &self.account_identifier,
                     &[],
                     Some(&parts.session_token_auth_header),
                     serde_json::Value::Null,
                     None,
-                )
-                .await?;
+                ) => r?,
+            };
 
             match resp {
                 ExecResponse::QueryAsync(_) => {}
@@ -1342,7 +1421,7 @@ impl SnowflakeApi {
         cancel: &CancellationToken,
     ) -> Result<(QueryMetadata, ArrowChunkStream), SnowflakeApiError> {
         let (metadata, body) = self
-            .resolve_arrow_query(sql, request_id, binds, cancel)
+            .resolve_arrow_query(sql, request_id, binds, cancel, HashMap::new())
             .await?;
         let stream = match body {
             ResolvedArrowResult::Empty => stream::empty().boxed(),
@@ -1371,7 +1450,15 @@ impl SnowflakeApi {
     ) -> Result<(RequestParams, R), SnowflakeApiError> {
         let params = RequestParams::new();
         let resp = self
-            .run_sql_with_params::<R>(sql_text, query_type, params, &[], false, false)
+            .run_sql_with_params::<R>(
+                sql_text,
+                query_type,
+                params,
+                &[],
+                false,
+                false,
+                HashMap::new(),
+            )
             .await?;
         Ok((params, resp))
     }
@@ -1382,6 +1469,7 @@ impl SnowflakeApi {
     /// flips the gosnowflake `WithAsyncMode` toggle: when true, Snowflake
     /// returns the `query_id` immediately (333334) instead of polling the
     /// query to completion in this same request.
+    #[allow(clippy::too_many_arguments)]
     async fn run_sql_with_params<R: serde::de::DeserializeOwned>(
         &self,
         sql_text: &str,
@@ -1390,6 +1478,7 @@ impl SnowflakeApi {
         binds: &[Bind],
         describe_only: bool,
         async_exec: bool,
+        parameters: HashMap<String, serde_json::Value>,
     ) -> Result<R, SnowflakeApiError> {
         log::debug!("Executing: {sql_text}");
 
@@ -1416,6 +1505,7 @@ impl SnowflakeApi {
             is_internal: false,
             describe_only,
             bindings,
+            parameters,
         };
 
         let resp = self
@@ -1632,6 +1722,50 @@ impl<'a> QueryBuilder<'a> {
             .await
     }
 
+    /// Run a multi-statement payload and return one [`QueryResult`] per
+    /// child statement, in source order. Lets Snowflake count statements
+    /// (sets `MULTI_STATEMENT_COUNT = 0`); use [`Self::execute_multi_exact`]
+    /// to require an exact count.
+    ///
+    /// Bindings span the whole payload positionally: the first `?` in
+    /// statement 1 is bind 1, the first `?` in statement 2 keeps counting.
+    pub async fn execute_multi(self) -> Result<Vec<QueryResult>, SnowflakeApiError> {
+        self.execute_multi_with_count(0).await
+    }
+
+    /// Like [`Self::execute_multi`], but reject the submit if the SQL
+    /// doesn't contain exactly `count` statements. Mirrors gosnowflake's
+    /// `WithMultiStatement(N)` strict mode. Pass `1` to assert single-statement.
+    pub async fn execute_multi_exact(
+        self,
+        count: u32,
+    ) -> Result<Vec<QueryResult>, SnowflakeApiError> {
+        self.execute_multi_with_count(count).await
+    }
+
+    async fn execute_multi_with_count(
+        self,
+        count: u32,
+    ) -> Result<Vec<QueryResult>, SnowflakeApiError> {
+        let owned;
+        let _drop_guard;
+        let cancel = match self.cancel {
+            Cancellation::Borrowed(c) => c,
+            Cancellation::OnDrop(token, guard) => {
+                owned = token;
+                _drop_guard = guard;
+                &owned
+            }
+            Cancellation::None => {
+                owned = CancellationToken::new();
+                &owned
+            }
+        };
+        self.api
+            .execute_multi_inner(self.sql, self.request_id, &self.binds, cancel, count)
+            .await
+    }
+
     /// Submit the built query without waiting for results. See
     /// [`SnowflakeApi::submit_async`] for the deferred-fetch flow this
     /// enables. Honors `with_cancel` / `cancel_on_drop` for the submit
@@ -1678,6 +1812,7 @@ impl<'a> QueryBuilder<'a> {
                 &self.binds,
                 true,
                 false,
+                HashMap::new(),
             )
             .await?;
         match resp {
