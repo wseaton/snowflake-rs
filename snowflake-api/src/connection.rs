@@ -50,6 +50,10 @@ pub enum QueryType {
     /// POST /queries/v1/abort-request. Cancels an in-flight query identified
     /// by the original query's `request_id` (carried in the body, not the path).
     AbortRequest,
+    /// POST /session/heartbeat. Keeps the session token alive when the
+    /// caller opted into `client_session_keep_alive` on the builder. Body
+    /// is empty; auth is the current session token.
+    Heartbeat,
 }
 
 impl QueryType {
@@ -95,6 +99,11 @@ impl QueryType {
             },
             Self::AbortRequest => QueryContext {
                 path: Cow::Borrowed("queries/v1/abort-request"),
+                accept_mime: "application/snowflake",
+                method: Method::POST,
+            },
+            Self::Heartbeat => QueryContext {
+                path: Cow::Borrowed("session/heartbeat"),
                 accept_mime: "application/snowflake",
                 method: Method::POST,
             },

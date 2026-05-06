@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     pretty_env_logger::init();
 
     let args = Args::parse();
-    let mut api = SnowflakeApi::from_env()?;
+    let api = SnowflakeApi::from_env()?;
 
     log::info!("Creating table");
     api.exec(

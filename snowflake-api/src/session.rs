@@ -20,7 +20,7 @@ use crate::requests::{
     ClientEnvironment, LoginRequest, LoginRequestCommon, PasswordLoginRequest, PasswordRequestData,
     RenewSessionRequest, SessionParameters,
 };
-use crate::responses::AuthResponse;
+use crate::responses::{AuthResponse, BaseRestResponse};
 
 #[derive(Error, Debug)]
 pub enum AuthError {
@@ -388,7 +388,8 @@ impl Session {
         Ok(self.build_parts(&new_state))
     }
 
-    pub async fn close(&mut self) -> Result<(), AuthError> {
+    // &self (not &mut): only mutation is ArcSwap, so Arc<Session> callers can close.
+    pub async fn close(&self) -> Result<(), AuthError> {
         let Some(state) = self.auth_state.swap(None) else {
             return Ok(());
         };
@@ -643,5 +644,57 @@ impl Session {
             )),
             _ => Err(AuthError::UnexpectedResponse),
         }
+    }
+
+    /// Hit `/session/heartbeat` to keep the cached session token fresh. No-op
+    /// if no session has been created yet (we don't auth purely to heartbeat).
+    /// On `390112` we force-renew once and retry; the next tick handles any
+    /// further failures.
+    pub async fn heartbeat(&self) -> Result<(), AuthError> {
+        if self.auth_state.load().is_none() {
+            return Ok(());
+        }
+        let parts = self.get_token().await?;
+        let resp = self
+            .send_heartbeat(&parts.session_token_auth_header)
+            .await?;
+        if resp.success {
+            return Ok(());
+        }
+        if resp.code.as_deref() == Some("390112") {
+            log::debug!("Heartbeat saw 390112; renewing and retrying once");
+            let parts = self.force_renew().await?;
+            let resp = self
+                .send_heartbeat(&parts.session_token_auth_header)
+                .await?;
+            if resp.success {
+                return Ok(());
+            }
+            return Err(AuthError::AuthFailed(
+                resp.code.unwrap_or_default(),
+                resp.message.unwrap_or_default(),
+            ));
+        }
+        Err(AuthError::AuthFailed(
+            resp.code.unwrap_or_default(),
+            resp.message.unwrap_or_default(),
+        ))
+    }
+
+    async fn send_heartbeat(
+        &self,
+        auth_header: &str,
+    ) -> Result<BaseRestResponse<serde_json::Value>, AuthError> {
+        Ok(self
+            .connection
+            .request::<BaseRestResponse<serde_json::Value>>(
+                QueryType::Heartbeat,
+                &self.account_identifier,
+                &[],
+                Some(auth_header),
+                serde_json::Value::Null,
+                None,
+            )
+            .await?)
     }
 }

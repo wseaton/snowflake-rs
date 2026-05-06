@@ -344,19 +344,45 @@ pub struct CertificateArgs {
     pub private_key_pem: String,
 }
 
+/// Default heartbeat interval when `client_session_keep_alive` is enabled
+/// without an explicit value. Matches gosnowflake's typical effective period
+/// (`master_validity / 4`, with `master_validity` defaulting to 4h).
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
+
 #[must_use]
 pub struct SnowflakeApiBuilder {
     pub auth: AuthArgs,
     client: Option<ClientWithMiddleware>,
+    keep_alive: Option<Duration>,
 }
 
 impl SnowflakeApiBuilder {
     pub fn new(auth: AuthArgs) -> Self {
-        Self { auth, client: None }
+        Self {
+            auth,
+            client: None,
+            keep_alive: None,
+        }
     }
 
     pub fn with_client(mut self, client: ClientWithMiddleware) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Enable / disable the background `/session/heartbeat` task. When on,
+    /// uses [`DEFAULT_KEEP_ALIVE_INTERVAL`]; for an explicit period use
+    /// [`Self::with_keep_alive_interval`]. Equivalent to gosnowflake's
+    /// `client_session_keep_alive` parameter.
+    pub fn with_keep_alive(mut self, enabled: bool) -> Self {
+        self.keep_alive = enabled.then_some(DEFAULT_KEEP_ALIVE_INTERVAL);
+        self
+    }
+
+    /// Enable the heartbeat task with a caller-chosen interval. Implies
+    /// `with_keep_alive(true)`.
+    pub fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
+        self.keep_alive = Some(interval);
         self
     }
 
@@ -400,20 +426,59 @@ impl SnowflakeApiBuilder {
         };
 
         let account_identifier = self.auth.account_identifier.to_uppercase();
+        let session = Arc::new(session);
+        let keep_alive = self
+            .keep_alive
+            .map(|interval| KeepAliveTask::spawn(Arc::clone(&session), interval));
 
-        Ok(SnowflakeApi::new(
-            Arc::clone(&connection),
+        Ok(SnowflakeApi {
+            connection: Arc::clone(&connection),
             session,
             account_identifier,
-        ))
+            keep_alive,
+        })
     }
 }
 
 /// Snowflake API, keeps connection pool and manages session for you
 pub struct SnowflakeApi {
     connection: Arc<Connection>,
-    session: Session,
+    session: Arc<Session>,
     account_identifier: String,
+    // Held for Drop side-effect: cancels the heartbeat task with the API.
+    #[allow(dead_code)]
+    keep_alive: Option<KeepAliveTask>,
+}
+
+/// Background `/session/heartbeat` poller. Spawned by the builder when
+/// `with_keep_alive` is set; the held `DropGuard` cancels the task when the
+/// `SnowflakeApi` is dropped, and the task observes that via its `select!`
+/// loop and exits.
+struct KeepAliveTask {
+    _cancel: tokio_util::sync::DropGuard,
+}
+
+impl KeepAliveTask {
+    fn spawn(session: Arc<Session>, interval: Duration) -> Self {
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = task_token.cancelled() => return,
+                    () = tokio::time::sleep(interval) => {}
+                }
+                match session.heartbeat().await {
+                    Ok(()) => log::debug!("session heartbeat ok"),
+                    Err(e) => log::warn!("session heartbeat failed: {e}"),
+                }
+            }
+        });
+        Self {
+            _cancel: token.drop_guard(),
+        }
+    }
 }
 
 impl SnowflakeApi {
@@ -421,8 +486,9 @@ impl SnowflakeApi {
     pub fn new(connection: Arc<Connection>, session: Session, account_identifier: String) -> Self {
         Self {
             connection,
-            session,
+            session: Arc::new(session),
             account_identifier,
+            keep_alive: None,
         }
     }
     /// Initialize object with password auth. Authentication happens on the first request.
@@ -527,7 +593,7 @@ impl SnowflakeApi {
     /// Closes the current session, this is necessary to clean up temporary objects (tables, functions, etc)
     /// which are Snowflake session dependent.
     /// If another request is made the new session will be initiated.
-    pub async fn close_session(&mut self) -> Result<(), SnowflakeApiError> {
+    pub async fn close_session(&self) -> Result<(), SnowflakeApiError> {
         self.session.close().await?;
         Ok(())
     }
