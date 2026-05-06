@@ -39,6 +39,8 @@ use session::{AuthError, Session};
 
 use crate::connection::QueryType;
 use crate::connection::{Connection, ConnectionError, RequestParams};
+pub use crate::requests::Bind;
+
 use crate::requests::{AbortRequest, ExecRequest};
 use crate::responses::{
     is_query_in_progress, is_query_not_executing, is_session_expired, is_sql_execution_cancelled,
@@ -515,6 +517,28 @@ impl SnowflakeApi {
         Ok(resp)
     }
 
+    /// Builder entry point for queries that need bind parameters,
+    /// cancellation, or a caller-supplied `request_id`. For unbound,
+    /// non-cancellable queries [`SnowflakeApi::exec`] is shorter.
+    ///
+    /// ```ignore
+    /// let r = api.query("SELECT name FROM users WHERE id = ? AND active = ?")
+    ///     .bind(123_i64)
+    ///     .bind(true)
+    ///     .with_cancel(&cancel_token)
+    ///     .execute()
+    ///     .await?;
+    /// ```
+    pub fn query<'a>(&'a self, sql: &'a str) -> QueryBuilder<'a> {
+        QueryBuilder {
+            api: self,
+            sql,
+            binds: Vec::new(),
+            cancel: None,
+            request_id: None,
+        }
+    }
+
     /// Execute a query with cooperative cancellation. Cancelling the token
     /// before completion sends a Snowflake `abort-request` for the query and
     /// returns `SnowflakeApiError::QueryCancelled`. Useful for REST APIs
@@ -536,7 +560,7 @@ impl SnowflakeApi {
         sql: &str,
         cancel: &CancellationToken,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
-        self.exec_raw_inner(sql, None, cancel).await
+        self.exec_raw_inner(sql, None, &[], cancel).await
     }
 
     /// Same as [`SnowflakeApi::exec_with_cancel`], but the caller supplies
@@ -552,7 +576,9 @@ impl SnowflakeApi {
         request_id: Uuid,
         cancel: &CancellationToken,
     ) -> Result<QueryResult, SnowflakeApiError> {
-        let raw = self.exec_raw_inner(sql, Some(request_id), cancel).await?;
+        let raw = self
+            .exec_raw_inner(sql, Some(request_id), &[], cancel)
+            .await?;
         Ok(raw.deserialize_arrow()?)
     }
 
@@ -560,6 +586,7 @@ impl SnowflakeApi {
         &self,
         sql: &str,
         request_id: Option<Uuid>,
+        binds: &[Bind],
         cancel: &CancellationToken,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
         let put_re = Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").unwrap();
@@ -567,14 +594,20 @@ impl SnowflakeApi {
         if put_re.is_match(sql) {
             // PUT goes through a different non-cancellable flow today. The
             // caller's token can still be respected before the upload starts;
-            // once we're streaming to S3 we don't currently abort.
+            // once we're streaming to S3 we don't currently abort. PUT
+            // statements don't accept bind parameters.
             if cancel.is_cancelled() {
                 return Err(SnowflakeApiError::QueryCancelled);
+            }
+            if !binds.is_empty() {
+                return Err(SnowflakeApiError::Unimplemented(
+                    "bind parameters on PUT statements".to_owned(),
+                ));
             }
             log::info!("Detected PUT query");
             self.exec_put(sql).await.map(|()| RawQueryResult::Empty)
         } else {
-            self.exec_arrow_raw_with_cancel(sql, request_id, cancel)
+            self.exec_arrow_raw_with_cancel(sql, request_id, binds, cancel)
                 .await
         }
     }
@@ -640,13 +673,15 @@ impl SnowflakeApi {
     async fn exec_arrow_raw(&self, sql: &str) -> Result<RawQueryResult, SnowflakeApiError> {
         // Non-cancellable path uses a token that never fires.
         let cancel = CancellationToken::new();
-        self.exec_arrow_raw_with_cancel(sql, None, &cancel).await
+        self.exec_arrow_raw_with_cancel(sql, None, &[], &cancel)
+            .await
     }
 
     async fn exec_arrow_raw_with_cancel(
         &self,
         sql: &str,
         request_id: Option<Uuid>,
+        binds: &[Bind],
         cancel: &CancellationToken,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
         if cancel.is_cancelled() {
@@ -664,7 +699,7 @@ impl SnowflakeApi {
         let mut resp = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
-            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params) => r?,
+            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds) => r?,
         };
         log::debug!("Got query response: {resp:?}");
 
@@ -744,7 +779,7 @@ impl SnowflakeApi {
     ) -> Result<(RequestParams, R), SnowflakeApiError> {
         let params = RequestParams::new();
         let resp = self
-            .run_sql_with_params::<R>(sql_text, query_type, params)
+            .run_sql_with_params::<R>(sql_text, query_type, params, &[])
             .await?;
         Ok((params, resp))
     }
@@ -757,16 +792,32 @@ impl SnowflakeApi {
         sql_text: &str,
         query_type: QueryType,
         params: RequestParams,
+        binds: &[Bind],
     ) -> Result<R, SnowflakeApiError> {
         log::debug!("Executing: {sql_text}");
 
         let parts = self.session.get_token().await?;
+
+        // Snowflake's bindings field uses 1-indexed string keys to match `?`
+        // placeholder positions in the SQL. Empty -> serialize as omitted.
+        let bindings = if binds.is_empty() {
+            None
+        } else {
+            Some(
+                binds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| ((i + 1).to_string(), b.0.clone()))
+                    .collect(),
+            )
+        };
 
         let body = ExecRequest {
             sql_text: sql_text.to_string(),
             async_exec: false,
             sequence_id: parts.sequence_id,
             is_internal: false,
+            bindings,
         };
 
         let resp = self
@@ -851,5 +902,75 @@ impl SnowflakeApi {
             log::warn!("Best-effort cancel failed for request_id={request_id}: {e}");
         }
         Err(SnowflakeApiError::QueryCancelled)
+    }
+}
+
+/// Fluent builder returned by [`SnowflakeApi::query`]. Accumulates bind
+/// parameters and optional cancellation/request-id, then runs the query
+/// via `execute()` (deserialized Arrow) or `execute_raw()` (raw bytes).
+pub struct QueryBuilder<'a> {
+    api: &'a SnowflakeApi,
+    sql: &'a str,
+    binds: Vec<Bind>,
+    cancel: Option<&'a CancellationToken>,
+    request_id: Option<Uuid>,
+}
+
+impl<'a> QueryBuilder<'a> {
+    /// Append a single positional bind parameter. Order matters: the first
+    /// `bind()` matches the first `?` in the SQL.
+    #[must_use]
+    pub fn bind<B: Into<Bind>>(mut self, value: B) -> Self {
+        self.binds.push(value.into());
+        self
+    }
+
+    /// Append several binds at once. Useful for `iter().map(Into::into)`
+    /// patterns when the values come from a heterogeneous source.
+    #[must_use]
+    pub fn binds<I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = Bind>,
+    {
+        self.binds.extend(values);
+        self
+    }
+
+    /// Wire up cooperative cancellation. See
+    /// [`SnowflakeApi::exec_with_cancel`] for the semantics.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Pre-set the `request_id` so it can be used to cancel the query from
+    /// another task via [`SnowflakeApi::cancel_query`].
+    #[must_use]
+    pub fn request_id(mut self, id: Uuid) -> Self {
+        self.request_id = Some(id);
+        self
+    }
+
+    /// Run the query and return Arrow-deserialized results.
+    pub async fn execute(self) -> Result<QueryResult, SnowflakeApiError> {
+        let raw = self.execute_raw().await?;
+        Ok(raw.deserialize_arrow()?)
+    }
+
+    /// Run the query and return the raw response (Arrow IPC bytes or JSON).
+    pub async fn execute_raw(self) -> Result<RawQueryResult, SnowflakeApiError> {
+        // If the caller didn't supply a token, use one that never fires so
+        // the inner select! still has something to await on.
+        let owned_cancel;
+        let cancel = if let Some(c) = self.cancel {
+            c
+        } else {
+            owned_cancel = CancellationToken::new();
+            &owned_cancel
+        };
+        self.api
+            .exec_raw_inner(self.sql, self.request_id, &self.binds, cancel)
+            .await
     }
 }

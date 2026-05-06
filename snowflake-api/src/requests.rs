@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 #[derive(Serialize, Debug)]
@@ -7,6 +9,113 @@ pub struct ExecRequest {
     pub async_exec: bool,
     pub sequence_id: u64,
     pub is_internal: bool,
+    /// Positional bindings for `?` placeholders. Keys are 1-indexed string
+    /// positions ("1", "2", ...) per Snowflake's internal API. `None` is
+    /// serialized as omitted so unbound queries don't send the field at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bindings: Option<HashMap<String, BindParam>>,
+}
+
+/// One positional bind parameter on the wire. The Snowflake type name goes in
+/// `type_` (TEXT, FIXED, REAL, BOOLEAN, ...); the value is JSON, but in
+/// practice almost always a stringified primitive.
+#[derive(Serialize, Debug, Clone)]
+pub struct BindParam {
+    #[serde(rename = "type")]
+    pub type_: &'static str,
+    pub value: serde_json::Value,
+}
+
+/// A typed bind value. Construct via the inherent constructors
+/// (`Bind::text`, `Bind::fixed`, etc.) or via `Into` from common primitive
+/// types. Pass a slice of these to the query builder.
+#[derive(Debug, Clone)]
+pub struct Bind(pub(crate) BindParam);
+
+impl Bind {
+    /// VARCHAR / TEXT / STRING.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self(BindParam {
+            type_: "TEXT",
+            value: serde_json::Value::String(s.into()),
+        })
+    }
+
+    /// Integer (NUMBER with scale 0). Snowflake expects FIXED values as
+    /// strings to preserve full 38-digit precision through JSON.
+    pub fn fixed(n: i64) -> Self {
+        Self(BindParam {
+            type_: "FIXED",
+            value: serde_json::Value::String(n.to_string()),
+        })
+    }
+
+    /// Floating-point (NUMBER / FLOAT / DOUBLE).
+    pub fn real(f: f64) -> Self {
+        Self(BindParam {
+            type_: "REAL",
+            value: serde_json::Value::String(f.to_string()),
+        })
+    }
+
+    /// BOOLEAN.
+    pub fn boolean(b: bool) -> Self {
+        Self(BindParam {
+            type_: "BOOLEAN",
+            value: serde_json::Value::String(b.to_string()),
+        })
+    }
+
+    /// SQL NULL with a type hint. The type matters because Snowflake's
+    /// type inference happens at bind time; a mistyped NULL can change
+    /// query semantics.
+    pub fn null(type_: &'static str) -> Self {
+        Self(BindParam {
+            type_,
+            value: serde_json::Value::Null,
+        })
+    }
+}
+
+impl From<&str> for Bind {
+    fn from(s: &str) -> Self {
+        Bind::text(s)
+    }
+}
+impl From<String> for Bind {
+    fn from(s: String) -> Self {
+        Bind::text(s)
+    }
+}
+impl From<i32> for Bind {
+    fn from(n: i32) -> Self {
+        Bind::fixed(i64::from(n))
+    }
+}
+impl From<i64> for Bind {
+    fn from(n: i64) -> Self {
+        Bind::fixed(n)
+    }
+}
+impl From<u32> for Bind {
+    fn from(n: u32) -> Self {
+        Bind::fixed(i64::from(n))
+    }
+}
+impl From<f32> for Bind {
+    fn from(f: f32) -> Self {
+        Bind::real(f64::from(f))
+    }
+}
+impl From<f64> for Bind {
+    fn from(f: f64) -> Self {
+        Bind::real(f)
+    }
+}
+impl From<bool> for Bind {
+    fn from(b: bool) -> Self {
+        Bind::boolean(b)
+    }
 }
 
 /// Body for `/queries/v1/abort-request`. The `request_id` is the UUID generated
