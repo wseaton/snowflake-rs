@@ -1017,6 +1017,32 @@ impl SnowflakeApi {
         ))
     }
 
+    /// Cross-process / cross-session cancel by `query_id`. Sends
+    /// Snowflake's `SYSTEM$CANCEL_QUERY('<id>')` system function as a
+    /// regular SQL statement; works from any session that has access
+    /// to the running query (the owning role, or any role with the
+    /// `MONITOR` privilege on the query's session).
+    ///
+    /// Use this when the canceller doesn't share a process with the
+    /// runner — e.g., a "POST /query" handler started the query and
+    /// returned [`QueryHandle::query_id`], and a separate "POST
+    /// /query/:id/cancel" handler in a different worker needs to abort
+    /// it. If both ends share a process, [`Self::cancel_query`] (by
+    /// `request_id`) is one round-trip cheaper.
+    ///
+    /// Idempotent: if the query has already finished, Snowflake
+    /// returns "Query is no longer running" as a normal result and we
+    /// surface `Ok(())`.
+    pub async fn cancel_query_by_id(&self, query_id: &str) -> Result<(), SnowflakeApiError> {
+        // Query ids are UUID-like; defensive escape for single quotes
+        // in case Snowflake ever loosens the format.
+        let escaped = query_id.replace('\'', "''");
+        let sql = format!("SELECT SYSTEM$CANCEL_QUERY('{escaped}')");
+        log::debug!("Cancelling query by id {query_id}");
+        self.exec(&sql).await?;
+        Ok(())
+    }
+
     async fn send_abort_request(
         &self,
         request_id: Uuid,
