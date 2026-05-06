@@ -102,10 +102,9 @@ impl QueryType {
     }
 }
 
-/// Per-request identifiers that Snowflake uses to correlate retries and
-/// cancellation. We lift these out of `Connection::request` so callers (the
-/// query exec path) can hold onto the `request_id` and later send an abort
-/// referencing it.
+/// Per-request identifiers Snowflake uses for retry/cancel correlation.
+/// Lifted out of `Connection::request` so the exec path can stash the
+/// `request_id` for later abort.
 #[derive(Clone, Copy, Debug)]
 pub struct RequestParams {
     pub request_id: Uuid,
@@ -117,6 +116,17 @@ impl RequestParams {
         Self {
             request_id: Uuid::new_v4(),
             request_guid: Uuid::new_v4(),
+        }
+    }
+
+    /// Build with an optional pre-chosen `request_id`. `None` => fresh.
+    pub fn or_new(request_id: Option<Uuid>) -> Self {
+        match request_id {
+            Some(id) => Self {
+                request_id: id,
+                request_guid: Uuid::new_v4(),
+            },
+            None => Self::new(),
         }
     }
 }

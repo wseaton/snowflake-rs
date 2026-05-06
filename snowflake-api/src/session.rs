@@ -348,6 +348,46 @@ impl Session {
         }
     }
 
+    /// Renew now, regardless of TTL. For callers that observed an explicit
+    /// `390112` from the server mid-flight and need to refresh before
+    /// retrying. Falls back to a full re-create if the master token is
+    /// gone or itself expired.
+    pub async fn force_renew(&self) -> Result<AuthParts, AuthError> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        let current = self.auth_state.load_full();
+        let new_state = match current.as_deref() {
+            Some(s) if !s.master_token.is_expired() => self.renew(s).await?,
+            _ => {
+                let tokens = match self.auth_type {
+                    AuthType::Certificate => {
+                        log::info!("Re-creating session (certificate auth)");
+                        if cfg!(feature = "cert-auth") {
+                            self.create(self.cert_request_body()?).await?
+                        } else {
+                            return Err(AuthError::MissingCertificate);
+                        }
+                    }
+                    AuthType::Password => {
+                        log::info!("Re-creating session (password auth)");
+                        self.create(self.passwd_request_body()?).await?
+                    }
+                    #[cfg(feature = "browser-auth")]
+                    AuthType::Browser => {
+                        log::info!("Re-creating session (browser auth)");
+                        self.create_browser_session().await?
+                    }
+                };
+                self.sequence_id.store(0, Ordering::Relaxed);
+                tokens
+            }
+        };
+
+        let new_state = Arc::new(new_state);
+        self.auth_state.store(Some(Arc::clone(&new_state)));
+        Ok(self.build_parts(&new_state))
+    }
+
     pub async fn close(&mut self) -> Result<(), AuthError> {
         let Some(state) = self.auth_state.swap(None) else {
             return Ok(());
