@@ -1,6 +1,8 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use futures::lock::Mutex;
 #[cfg(feature = "cert-auth")]
 use snowflake_jwt::generate_jwt_token;
@@ -64,11 +66,26 @@ pub enum AuthError {
 }
 
 #[derive(Debug)]
-struct AuthTokens {
+struct AuthState {
     session_token: AuthToken,
     master_token: AuthToken,
-    /// expected by snowflake api for all requests within session to follow sequence id
-    sequence_id: u64,
+    // Precomputed so the hot path in `get_token` doesn't reformat per query.
+    auth_header: String,
+}
+
+impl AuthState {
+    fn new(session_token: AuthToken, master_token: AuthToken) -> Self {
+        let auth_header = session_token.auth_header();
+        Self {
+            session_token,
+            master_token,
+            auth_header,
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        !self.master_token.is_expired() && !self.session_token.is_expired()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +145,11 @@ enum AuthType {
 pub struct Session {
     connection: Arc<Connection>,
 
-    auth_tokens: Mutex<Option<AuthTokens>>,
+    auth_state: ArcSwapOption<AuthState>,
+    sequence_id: AtomicU64,
+    // Single-flights login/renew so concurrent first-callers share one
+    // round-trip instead of racing each other.
+    refresh_lock: Mutex<()>,
     auth_type: AuthType,
     account_identifier: String,
 
@@ -171,7 +192,9 @@ impl Session {
 
         Self {
             connection,
-            auth_tokens: Mutex::new(None),
+            auth_state: ArcSwapOption::empty(),
+            sequence_id: AtomicU64::new(0),
+            refresh_lock: Mutex::new(()),
             auth_type: AuthType::Certificate,
             private_key_pem,
             account_identifier,
@@ -208,7 +231,9 @@ impl Session {
 
         Self {
             connection,
-            auth_tokens: Mutex::new(None),
+            auth_state: ArcSwapOption::empty(),
+            sequence_id: AtomicU64::new(0),
+            refresh_lock: Mutex::new(()),
             auth_type: AuthType::Password,
             account_identifier,
             warehouse: warehouse.map(str::to_uppercase),
@@ -243,7 +268,9 @@ impl Session {
 
         Self {
             connection,
-            auth_tokens: Mutex::new(None),
+            auth_state: ArcSwapOption::empty(),
+            sequence_id: AtomicU64::new(0),
+            refresh_lock: Mutex::new(()),
             auth_type: AuthType::Browser,
             account_identifier,
             warehouse: warehouse.map(str::to_uppercase),
@@ -256,77 +283,96 @@ impl Session {
         }
     }
 
-    /// Get cached token or request a new one if old one has expired.
+    /// Get cached auth + a fresh sequence id. Hot path is lock-free
+    /// (`ArcSwap` load + atomic `fetch_add`). Refresh single-flights
+    /// via `refresh_lock`.
     pub async fn get_token(&self) -> Result<AuthParts, AuthError> {
-        let mut auth_tokens = self.auth_tokens.lock().await;
-        if auth_tokens.is_none()
-            || auth_tokens
-                .as_ref()
-                .is_some_and(|at| at.master_token.is_expired())
-        {
-            // Create new session if tokens are absent or can not be exchanged
+        if let Some(state) = self.auth_state.load_full() {
+            if state.is_fresh() {
+                return Ok(self.build_parts(&state));
+            }
+        }
+
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        // Re-check: another caller may have refreshed while we waited.
+        if let Some(state) = self.auth_state.load_full() {
+            if state.is_fresh() {
+                return Ok(self.build_parts(&state));
+            }
+        }
+
+        let current = self.auth_state.load_full();
+        let need_full_create = current
+            .as_deref()
+            .is_none_or(|s| s.master_token.is_expired());
+
+        let new_state = if need_full_create {
             let tokens = match self.auth_type {
                 AuthType::Certificate => {
                     log::info!("Starting session with certificate authentication");
                     if cfg!(feature = "cert-auth") {
-                        self.create(self.cert_request_body()?).await
+                        self.create(self.cert_request_body()?).await?
                     } else {
-                        Err(AuthError::MissingCertificate)?
+                        return Err(AuthError::MissingCertificate);
                     }
                 }
                 AuthType::Password => {
                     log::info!("Starting session with password authentication");
-                    self.create(self.passwd_request_body()?).await
+                    self.create(self.passwd_request_body()?).await?
                 }
                 #[cfg(feature = "browser-auth")]
                 AuthType::Browser => {
                     log::info!("Starting session with external browser authentication");
-                    self.create_browser_session().await
+                    self.create_browser_session().await?
                 }
-            }?;
-            *auth_tokens = Some(tokens);
-        } else if auth_tokens
-            .as_ref()
-            .is_some_and(|at| at.session_token.is_expired())
-        {
-            // Renew old session token
-            let old_token = auth_tokens.take().unwrap();
-            let tokens = self.renew(old_token).await?;
-            *auth_tokens = Some(tokens);
+            };
+            // Full re-create => new Snowflake session => reset counter.
+            self.sequence_id.store(0, Ordering::Relaxed);
+            tokens
+        } else {
+            self.renew(&current.expect("checked above")).await?
+        };
+
+        let new_state = Arc::new(new_state);
+        self.auth_state.store(Some(Arc::clone(&new_state)));
+        Ok(self.build_parts(&new_state))
+    }
+
+    fn build_parts(&self, state: &AuthState) -> AuthParts {
+        // +1 to match pre-refactor semantics where first id returned is 1.
+        let sequence_id = self.sequence_id.fetch_add(1, Ordering::Relaxed) + 1;
+        AuthParts {
+            session_token_auth_header: state.auth_header.clone(),
+            sequence_id,
         }
-        auth_tokens.as_mut().unwrap().sequence_id += 1;
-        Ok(AuthParts {
-            session_token_auth_header: auth_tokens.as_ref().unwrap().session_token.auth_header(),
-            sequence_id: auth_tokens.as_ref().unwrap().sequence_id,
-        })
     }
 
     pub async fn close(&mut self) -> Result<(), AuthError> {
-        if let Some(tokens) = self.auth_tokens.lock().await.take() {
-            log::debug!("Closing sessions");
+        let Some(state) = self.auth_state.swap(None) else {
+            return Ok(());
+        };
+        log::debug!("Closing sessions");
 
-            let resp = self
-                .connection
-                .request::<AuthResponse>(
-                    QueryType::CloseSession,
-                    &self.account_identifier,
-                    &[("delete", "true")],
-                    Some(&tokens.session_token.auth_header()),
-                    serde_json::Value::default(),
-                    None,
-                )
-                .await?;
+        let resp = self
+            .connection
+            .request::<AuthResponse>(
+                QueryType::CloseSession,
+                &self.account_identifier,
+                &[("delete", "true")],
+                Some(&state.auth_header),
+                serde_json::Value::default(),
+                None,
+            )
+            .await?;
 
-            match resp {
-                AuthResponse::Close(_) => Ok(()),
-                AuthResponse::Error(e) => Err(AuthError::AuthFailed(
-                    e.code.unwrap_or_default(),
-                    e.message.unwrap_or_default(),
-                )),
-                _ => Err(AuthError::UnexpectedResponse),
-            }
-        } else {
-            Ok(())
+        match resp {
+            AuthResponse::Close(_) => Ok(()),
+            AuthResponse::Error(e) => Err(AuthError::AuthFailed(
+                e.code.unwrap_or_default(),
+                e.message.unwrap_or_default(),
+            )),
+            _ => Err(AuthError::UnexpectedResponse),
         }
     }
 
@@ -364,7 +410,7 @@ impl Session {
     async fn create<T: serde::ser::Serialize>(
         &self,
         body: LoginRequest<T>,
-    ) -> Result<AuthTokens, AuthError> {
+    ) -> Result<AuthState, AuthError> {
         let mut get_params = Vec::new();
         if let Some(warehouse) = &self.warehouse {
             get_params.push(("warehouse", warehouse.as_str()));
@@ -401,11 +447,7 @@ impl Session {
                 let master_token =
                     AuthToken::new(&lr.data.master_token, lr.data.master_validity_in_seconds);
 
-                Ok(AuthTokens {
-                    session_token,
-                    master_token,
-                    sequence_id: 0,
-                })
+                Ok(AuthState::new(session_token, master_token))
             }
             AuthResponse::Error(e) => Err(AuthError::AuthFailed(
                 e.code.unwrap_or_default(),
@@ -443,7 +485,7 @@ impl Session {
     /// 5. Wait for token on local listener
     /// 6. Send login-request with token and proof key
     #[cfg(feature = "browser-auth")]
-    async fn create_browser_session(&self) -> Result<AuthTokens, AuthError> {
+    async fn create_browser_session(&self) -> Result<AuthState, AuthError> {
         use crate::browser::{
             create_local_listener, generate_proof_key, open_browser, wait_for_token,
         };
@@ -525,11 +567,13 @@ impl Session {
         self.create(login_request).await
     }
 
-    async fn renew(&self, token: AuthTokens) -> Result<AuthTokens, AuthError> {
+    // Caller must NOT reset `sequence_id`: renewals preserve the Snowflake
+    // session id space.
+    async fn renew(&self, old: &AuthState) -> Result<AuthState, AuthError> {
         log::debug!("Renewing the token");
-        let auth = token.master_token.auth_header();
+        let auth = old.master_token.auth_header();
         let body = RenewSessionRequest {
-            old_session_token: token.session_token.token.clone(),
+            old_session_token: old.session_token.token.clone(),
             request_type: "RENEW".to_string(),
         };
 
@@ -551,12 +595,7 @@ impl Session {
                     AuthToken::new(&rs.data.session_token, rs.data.validity_in_seconds_s_t);
                 let master_token =
                     AuthToken::new(&rs.data.master_token, rs.data.validity_in_seconds_m_t);
-
-                Ok(AuthTokens {
-                    session_token,
-                    master_token,
-                    sequence_id: token.sequence_id,
-                })
+                Ok(AuthState::new(session_token, master_token))
             }
             AuthResponse::Error(e) => Err(AuthError::AuthFailed(
                 e.code.unwrap_or_default(),
