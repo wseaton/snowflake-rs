@@ -55,6 +55,9 @@ pub enum AuthError {
     #[error("Failed to exchange or request a new token")]
     TokenFetchFailed,
 
+    #[error("Login timed out after {0:?}")]
+    LoginTimeout(Duration),
+
     #[error("Enable the cert-auth feature to use certificate authentication")]
     CertAuthNotEnabled,
 
@@ -164,7 +167,11 @@ pub struct Session {
     #[allow(dead_code)]
     private_key_pem: Option<SecretString>,
     password: Option<SecretString>,
+    login_timeout: Duration,
 }
+
+/// <https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L27-L28>
+const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 // todo: make builder
 impl Session {
@@ -203,6 +210,7 @@ impl Session {
             role,
             schema,
             password: None,
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
         }
     }
 
@@ -241,6 +249,7 @@ impl Session {
             password: Some(password),
             schema,
             private_key_pem: None,
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
         }
     }
 
@@ -278,7 +287,12 @@ impl Session {
             password: None,
             schema,
             private_key_pem: None,
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
         }
+    }
+
+    pub fn set_login_timeout(&mut self, timeout: Duration) {
+        self.login_timeout = timeout;
     }
 
     /// Get cached auth + a fresh sequence id. Hot path is lock-free
@@ -445,8 +459,20 @@ impl Session {
     }
 
     /// Start new session, all the Snowflake temporary objects will be scoped towards it,
-    /// as well as temporary configuration parameters
+    /// as well as temporary configuration parameters.
+    ///
+    /// Enforces [`login_timeout`](https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L27-L28) (default 300s).
     async fn create<T: serde::ser::Serialize>(
+        &self,
+        body: LoginRequest<T>,
+    ) -> Result<AuthState, AuthError> {
+        let timeout = self.login_timeout;
+        tokio::time::timeout(timeout, self.create_inner(body))
+            .await
+            .map_err(|_| AuthError::LoginTimeout(timeout))?
+    }
+
+    async fn create_inner<T: serde::ser::Serialize>(
         &self,
         body: LoginRequest<T>,
     ) -> Result<AuthState, AuthError> {

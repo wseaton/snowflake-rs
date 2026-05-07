@@ -720,12 +720,18 @@ pub struct CertificateArgs {
 /// without an explicit value. Matches gosnowflake's typical effective period
 /// (`master_validity / 4`, with `master_validity` defaulting to 4h).
 const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// <https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L27-L28>
+const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[must_use]
 pub struct SnowflakeApiBuilder {
     pub auth: AuthArgs,
     client: Option<ClientWithMiddleware>,
     keep_alive: Option<Duration>,
+    connect_timeout: Duration,
+    request_timeout: Option<Duration>,
+    login_timeout: Duration,
 }
 
 impl SnowflakeApiBuilder {
@@ -734,6 +740,9 @@ impl SnowflakeApiBuilder {
             auth,
             client: None,
             keep_alive: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: None,
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
         }
     }
 
@@ -758,13 +767,41 @@ impl SnowflakeApiBuilder {
         self
     }
 
+    /// TCP + TLS handshake timeout. Default: 30s.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Total per-request timeout. None (default) means no limit. Set this
+    /// to cap how long any single HTTP round-trip can take.
+    ///
+    /// See gosnowflake [`DefaultRequestTimeout`](https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L29-L30) (default 0 = no limit).
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Login/auth flow timeout. Default: 300s.
+    ///
+    /// See gosnowflake [`DefaultLoginTimeout`](https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L27-L28).
+    pub fn with_login_timeout(mut self, timeout: Duration) -> Self {
+        self.login_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> Result<SnowflakeApi, SnowflakeApiError> {
-        let connection = match self.client {
-            Some(client) => Arc::new(Connection::new_with_middware(client)),
-            None => Arc::new(Connection::new()?),
+        let connection = if let Some(client) = self.client {
+            Arc::new(Connection::new_with_middware(client))
+        } else {
+            let builder = Connection::client_builder_with_timeouts(
+                self.connect_timeout,
+                self.request_timeout,
+            )?;
+            Arc::new(Connection::new_with_middware(builder.build()))
         };
 
-        let session = match self.auth.auth_type {
+        let mut session = match self.auth.auth_type {
             AuthType::Password(args) => Session::password_auth(
                 Arc::clone(&connection),
                 &self.auth.account_identifier,
@@ -796,6 +833,8 @@ impl SnowflakeApiBuilder {
                 self.auth.role.as_deref(),
             ),
         };
+
+        session.set_login_timeout(self.login_timeout);
 
         let account_identifier = self.auth.account_identifier.to_uppercase();
         let session = Arc::new(session);

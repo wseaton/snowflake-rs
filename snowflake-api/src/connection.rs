@@ -188,14 +188,30 @@ impl Connection {
     }
 
     pub fn default_client_builder() -> Result<reqwest_middleware::ClientBuilder, ConnectionError> {
+        Self::client_builder_with_timeouts(std::time::Duration::from_secs(30), None)
+    }
+
+    /// Build a reqwest client with explicit timeout configuration.
+    ///
+    /// `connect_timeout` caps TCP + TLS handshake. `request_timeout` caps the
+    /// entire request (None = no limit).
+    ///
+    /// See gosnowflake [timeout defaults](https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L23-L35).
+    pub fn client_builder_with_timeouts(
+        connect_timeout: std::time::Duration,
+        request_timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest_middleware::ClientBuilder, ConnectionError> {
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
 
-        let client = reqwest::ClientBuilder::new()
+        let mut client = reqwest::ClientBuilder::new()
             .user_agent("Rust/0.0.1")
             .gzip(true)
             .referer(false)
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(300));
+            .connect_timeout(connect_timeout);
+
+        if let Some(t) = request_timeout {
+            client = client.timeout(t);
+        }
 
         #[cfg(debug_assertions)]
         let client = client.connection_verbose(true);
