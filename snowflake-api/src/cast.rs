@@ -33,13 +33,15 @@ pub fn cast_structured_batch(batch: &RecordBatch) -> Result<RecordBatch, ArrowEr
 /// Like [`cast_structured_batch`], but `column_schema` (the Snowflake
 /// rowtype carried on [`crate::QueryMetadata::column_schema`]) supplies
 /// `ext_type_name` info that isn't in the Arrow field metadata yet.
-/// This is what `QueryResult::cast_structured` calls.
+/// Use this on the streaming path so `GEOGRAPHY` / `GEOMETRY` columns
+/// stay as raw `Utf8` `GeoJSON` instead of being shredded into
+/// `Map<Utf8, Utf8>`.
 ///
-/// Single-pass: figure out the action per column, fast-return the
-/// original batch if every column is pass-through, otherwise rebuild
-/// the schema once with `Arc::clone` for unchanged fields and a fresh
-/// `Field` only for ones that actually changed.
-pub(crate) fn cast_structured_batch_with_schema(
+/// Single-pass: classify each column, fast-return the original batch
+/// if every column is pass-through, otherwise rebuild the schema once
+/// with `Arc::clone` for unchanged fields and a fresh `Field` only
+/// for ones that actually changed.
+pub fn cast_structured_batch_with_schema(
     batch: &RecordBatch,
     column_schema: &[crate::FieldSchema],
 ) -> Result<RecordBatch, ArrowError> {

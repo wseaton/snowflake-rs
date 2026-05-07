@@ -61,7 +61,7 @@ mod requests;
 mod responses;
 mod session;
 
-pub use cast::cast_structured_batch;
+pub use cast::{cast_structured_batch, cast_structured_batch_with_schema};
 
 #[derive(Error, Debug)]
 pub enum SnowflakeApiError {
@@ -586,6 +586,30 @@ impl QueryResult {
         }
         Ok(self)
     }
+}
+
+/// Wrap a `RecordBatchStream` so each emitted batch is run through
+/// [`cast_structured_batch_with_schema`] with the supplied
+/// `column_schema` (typically `meta.column_schema` from the same
+/// `execute_stream` call). `GEOGRAPHY` / `GEOMETRY` columns stay raw,
+/// `MAP` / `OBJECT` / `ARRAY` columns become typed Arrow Map / List.
+///
+/// ```ignore
+/// let (meta, stream) = api.query(sql).execute_stream().await?;
+/// let mut stream = cast_structured_stream(stream, meta.column_schema.clone());
+/// while let Some(batch) = stream.next().await { ... }
+/// ```
+pub fn cast_structured_stream(
+    stream: RecordBatchStream,
+    column_schema: Vec<FieldSchema>,
+) -> RecordBatchStream {
+    let schema = Arc::new(column_schema);
+    stream
+        .map(move |item| match item {
+            Ok(b) => cast::cast_structured_batch_with_schema(&b, &schema[..]).map_err(Into::into),
+            Err(e) => Err(e),
+        })
+        .boxed()
 }
 
 impl RawQueryResult {
