@@ -1,0 +1,54 @@
+name: Publish firn
+
+# Triggered by pushing a v* tag (e.g. `git tag v0.15.0 && git push origin v0.15.0`).
+#
+# Setup required (one-time, in crates.io UI):
+#   crates.io/settings/profile -> Trusted Publishers -> Add GitHub publisher
+#     repository: wseaton/firn
+#     workflow file: publish.yml
+#     environment: (leave blank, or set to "release" if using GitHub environments)
+#
+# After that, every v* tag push runs cargo publish via short-lived OIDC creds.
+# See: https://crates.io/docs/trusted-publishing
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC for crates.io trusted publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy -p firn --all-features --tests --benches --examples -- -D warnings
+
+      - name: cargo test
+        run: cargo test -p firn --all-features --lib
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version=$(cargo pkgid -p firn | sed -E 's/.*[#@]([0-9].*)/\1/')
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+
+      - name: Authenticate with crates.io (OIDC)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: cargo publish
+        run: cargo publish -p firn --token ${{ steps.auth.outputs.token }}
