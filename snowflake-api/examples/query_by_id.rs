@@ -16,13 +16,13 @@
 //! Reads credentials from a local `.env` (via `dotenvy`) and then
 //! `SnowflakeApi::from_env`. See `streaming.rs` for required env vars.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use std::time::Duration;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
-use snowflake_api::{QueryData, QueryStatus, SnowflakeApi};
+use firn::{QueryData, QueryStatus, SnowflakeApi};
 
 // `seq4(GENERATOR(ROWCOUNT => N))` is a cheap way to make Snowflake do
 // real work for a few seconds — we want to actually see RUNNING -> SUCCESS

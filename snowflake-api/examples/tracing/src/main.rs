@@ -9,8 +9,8 @@ use reqwest_middleware::Extension;
 use reqwest_tracing::{OtelName, SpanBackendWithUrl};
 use tracing_subscriber::layer::SubscriberExt;
 
-use snowflake_api::connection::Connection;
-use snowflake_api::{AuthArgs, QueryData, SnowflakeApiBuilder};
+use firn::connection::Connection;
+use firn::{AuthArgs, QueryData, SnowflakeApiBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,9 +34,7 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
     let client = Connection::default_client_builder()?
-        .with_init(Extension(OtelName(std::borrow::Cow::Borrowed(
-            "snowflake-api",
-        ))))
+        .with_init(Extension(OtelName(std::borrow::Cow::Borrowed("firn"))))
         .with(reqwest_tracing::TracingMiddleware::<SpanBackendWithUrl>::new());
 
     let builder = SnowflakeApiBuilder::new(AuthArgs::from_env()?).with_client(client.build());
@@ -50,7 +48,7 @@ async fn main() -> Result<()> {
 }
 
 #[tracing::instrument(name = "snowflake_api", skip(api))]
-async fn run_in_span(api: &snowflake_api::SnowflakeApi) -> anyhow::Result<()> {
+async fn run_in_span(api: &firn::SnowflakeApi) -> anyhow::Result<()> {
     let res = api.exec("select 'hello from snowflake' as col1;").await?;
     println!("query_id: {}", res.metadata.query_id);
 

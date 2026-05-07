@@ -6,12 +6,12 @@
 //!
 //! Reads credentials from environment variables; see `SnowflakeApi::from_env`.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 
-use snowflake_api::{Bind, QueryData, SnowflakeApi};
+use firn::{Bind, QueryData, SnowflakeApi};
 
 #[tokio::main]
 async fn main() -> Result<()> {

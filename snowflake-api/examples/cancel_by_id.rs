@@ -8,13 +8,13 @@
 //!
 //! Reads credentials from environment variables; see `SnowflakeApi::from_env`.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
-use snowflake_api::{SnowflakeApi, SnowflakeApiError};
+use firn::{SnowflakeApi, SnowflakeApiError};
 use tokio_util::sync::CancellationToken;
 
 const SLOW_QUERY: &str = "CALL SYSTEM$WAIT(60, 'SECONDS')";

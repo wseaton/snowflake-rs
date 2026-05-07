@@ -2,10 +2,10 @@
 //! executing it. No warehouse compute is consumed. Intended for codegen
 //! and pre-flight validation paths.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
-use snowflake_api::SnowflakeApi;
+use firn::SnowflakeApi;
 
 #[tokio::main]
 async fn main() -> Result<()> {

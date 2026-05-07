@@ -14,12 +14,12 @@
 //!
 //! Run with: `RUST_LOG=trace cargo run --example run_sql_long_running --all-features`
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 
-use snowflake_api::{QueryData, SnowflakeApi};
+use firn::{QueryData, SnowflakeApi};
 
 const RECURSIVE_CTE: &str = "\
 WITH RECURSIVE Compute_CTE AS (

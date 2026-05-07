@@ -6,7 +6,7 @@
 //! Run with a short interval to see the heartbeat fire repeatedly:
 //!
 //! ```text
-//! RUST_LOG=info,snowflake_api=debug \
+//! RUST_LOG=info,firn=debug \
 //!   cargo run --example keep_alive
 //! ```
 //!
@@ -14,12 +14,12 @@
 //! alive while `tokio::time::sleep` simulates a quiet dashboard. The task
 //! is aborted when `api` is dropped at the end of `main`.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use std::time::Duration;
 
 use anyhow::Result;
-use snowflake_api::{AuthArgs, SnowflakeApiBuilder};
+use firn::{AuthArgs, SnowflakeApiBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {

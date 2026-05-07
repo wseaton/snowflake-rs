@@ -3,16 +3,16 @@
 //! tasks 2..N would all stall behind task 1's session-create. After,
 //! they should each see their own near-equal latency.
 //!
-//! `RUST_LOG=info,snowflake_api=info cargo run --example parallel_queries
+//! `RUST_LOG=info,firn=info cargo run --example parallel_queries
 //! --features browser-auth -- 5`
 
-extern crate snowflake_api;
+extern crate firn;
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use snowflake_api::SnowflakeApi;
+use firn::SnowflakeApi;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -12,10 +12,10 @@
 //!
 //! Reads credentials from a local `.env`. See `streaming.rs`.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
-use snowflake_api::{QueryData, SnowflakeApi};
+use firn::{QueryData, SnowflakeApi};
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -13,14 +13,14 @@
 //! enough to produce multiple chunks, e.g. a few million rows from
 //! `SNOWFLAKE_SAMPLE_DATA`).
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
 use futures::StreamExt;
 
-use snowflake_api::SnowflakeApi;
+use firn::SnowflakeApi;
 
 const DEFAULT_SQL: &str = "\
 SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY, L_EXTENDEDPRICE

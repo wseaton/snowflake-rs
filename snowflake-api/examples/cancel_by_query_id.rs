@@ -8,12 +8,12 @@
 //!
 //! Reads credentials from a local `.env`. See `streaming.rs`.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use snowflake_api::{QueryStatus, SnowflakeApi};
+use firn::{QueryStatus, SnowflakeApi};
 
 const SLOW_SQL: &str = "CALL SYSTEM$WAIT(60, 'SECONDS')";
 

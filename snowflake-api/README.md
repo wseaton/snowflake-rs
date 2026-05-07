@@ -1,84 +1,101 @@
-# snowflake-rs
+# firn
 
-Snowflake library for undocumented public API. If you want to query documented public [SQL REST API](https://docs.snowflake.com/developer-guide/sql-api/intro) use [snowflake-jwt](https://crates.io/crates/snowflake-jwt) together with your favourite request library, see [./jwt/examples](../jwt/examples) for how it's done.
-
-## Features
-
-Since it does a lot of I/O the library is async-only, and currently has hard dependency on [tokio](https://tokio.rs/) as a runtime due to use of [reqwest](https://github.com/seanmonstar/reqwest).
-
-- [x] Single statements [example](./examples/run_sql.rs)
-- [ ] Multiple statements
-- [ ] Async requests (is it needed if whole library is async?)
-- [x] Query results in [Arrow](https://arrow.apache.org/)
-- [x] Chunked query results
-- [x] Password, certificate, env auth
-- [ ] Browser-auth
-- [x] Closing session
-- [x] Token renewal
-- [x] PUT support [example](./examples/filetransfer.rs)
-- [ ] GET support
-- [x] AWS integration
-- [ ] `GCloud` integration
-- [ ] Azure integration
-- [x] Parallel uploading of small files
-- [x] Glob support for PUT (eg `*.csv`)
-- [x] Polars support [example](./examples/polars/src/main.rs)
-- [x] Tracing / custom reqwest middlware [example](./examples/tracing/src/main.rs)
-
-## Why
-
-Snowflake has 2 public APIs, one is [SQL REST API](https://docs.snowflake.com/developer-guide/sql-api/intro), which is limited in its support of [PUT](https://docs.snowflake.com/en/sql-reference/sql/put) and [GET](https://docs.snowflake.com/en/sql-reference/sql/get) statements and another undocumented API, which is used by official [Drivers](https://docs.snowflake.com/en/developer-guide/drivers) with the support for both.
-
-This implementation emulates [gosnowflake](https://github.com/snowflakedb/gosnowflake) library, as each official driver comes with a different set of internal flags and defaults (which are selected by `CLIENT_APP_ID`) the Go implementation is the only one currently outputting Arrow by-default.
-
-We've chosen not to generate bindings for C/C++ [libsnowflakeclient](https://github.com/snowflakedb/libsnowflakeclient) library (which backs ODBC driver) as it is in active development and building it under macOS M1 is bigger effort than writing our own API wrapper.
-
-## Usage
-
-In your Cargo.toml:
+Rust client for Snowflake's internal HTTP API (the same endpoint the
+official drivers use). Forked from
+[`snowflake-api`](https://crates.io/crates/snowflake-api) at v0.14.0
+([andrusha/snowflake-rs](https://github.com/andrusha/snowflake-rs)).
 
 ```toml
 [dependencies]
-snowflake-api = "0.7.0"
+firn = "0.15"
 ```
 
-Check [examples](./examples) for working programs using the library.
+Default features: `cert-auth`. Optional: `browser-auth`, `polars`.
 
+## Quick start
 
 ```rust
-use anyhow::Result;
-use snowflake_api::{QueryResult, SnowflakeApi};
+use firn::{QueryData, SnowflakeApi};
 
-async fn run_query(sql: &str) -> Result<QueryResult> {
-    let mut api = SnowflakeApi::with_password_auth(
-        "ACCOUNT_IDENTIFIER",
-        Some("WAREHOUSE"),
-        Some("DATABASE"),
-        Some("SCHEMA"),
-        "USERNAME",
-        Some("ROLE"),
-        "PASSWORD",
-    )?;
-    let res = api.exec(sql).await?;
-
-    Ok(res)
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let api = SnowflakeApi::from_env()?;
+    let r = api.exec("SELECT current_version()").await?;
+    match r.data {
+        QueryData::Arrow(batches) => { /* ... */ }
+        QueryData::Json(v) => { /* ... */ }
+        QueryData::Empty => {}
+    }
+    Ok(())
 }
 ```
 
-Or using environment variables:
+## Features
 
-```rust
- use anyhow::Result;
-use snowflake_api::{QueryResult, SnowflakeApi};
+### Auth
+- password ([`with_password_auth`])
+- key-pair JWT ([`with_certificate_auth`], `cert-auth` feature, default)
+- external-browser SSO ([`with_browser_auth`], `browser-auth` feature)
+- env-driven ([`from_env`])
 
-async fn run_query(sql: &str) -> Result<QueryResult> {
-    let mut api = SnowflakeApi::from_env()?;
-    let res = api.exec(sql).await?;
+### Queries
+- single statement ([`run_sql.rs`](./examples/run_sql.rs))
+- positional `?` bind parameters ([`run_sql_bound.rs`](./examples/run_sql_bound.rs))
+- multi-statement (`execute_multi`, `execute_multi_exact`) ([`multi_statement.rs`](./examples/multi_statement.rs))
+- per-request session-parameter overrides (`with_session_param`) ([`session_params.rs`](./examples/session_params.rs))
+- async long-running queries with transparent polling ([`run_sql_long_running.rs`](./examples/run_sql_long_running.rs))
+- submit + fetch-by-`query_id` across processes (`submit_async`, `query_status`, `fetch_results`) ([`query_by_id.rs`](./examples/query_by_id.rs))
+- describe-only introspection (`describe()`) ([`describe_query.rs`](./examples/describe_query.rs))
 
-    Ok(res)
-}
-```
+### Results
+- Arrow `RecordBatch`, with streaming and raw-IPC variants ([`streaming.rs`](./examples/streaming.rs))
+- JSON results when the session is configured for JSON
+- per-query `QueryMetadata`: `query_id`, `total_rows`, `total_chunks`, `statement_type_id`, executing warehouse/database/schema/role
+- `cast_structured()` rewrites `MAP` / `OBJECT` / `ARRAY` columns from JSON-in-Utf8 into native Arrow `Map<Utf8, V>` / `List<E>` ([`compound_types.rs`](./examples/compound_types.rs))
+- `GEOGRAPHY` / `GEOMETRY` carried via `FieldSchema::ext_type_name`; `VECTOR` via `vector_dimension` + element type
+- `StatementType` enum, `is_dql()` predicate
 
-## PUT / GET
+### Cancellation
+- token-based via `CancellationToken` ([`cancel_query.rs`](./examples/cancel_query.rs))
+- cross-task by `request_id` (`cancel_query`) ([`cancel_by_id.rs`](./examples/cancel_by_id.rs))
+- cross-process by `query_id` (`cancel_query_by_id`) ([`cancel_by_query_id.rs`](./examples/cancel_by_query_id.rs))
 
-[PUT](https://docs.snowflake.com/en/sql-reference/sql/put)/[GET](https://docs.snowflake.com/en/sql-reference/sql/get) statements allow you to access Snowflake-owned storage instead of provisioning your own when doing [COPY INTO](https://docs.snowflake.com/en/sql-reference/sql/copy-into-table). Storage provider depends on which cloud your Snowflake account was provisioned in, hence the need to support multiple cloud backends.
+### Session
+- session-keep-alive heartbeat (`with_keep_alive`) ([`keep_alive.rs`](./examples/keep_alive.rs))
+- session-token renewal on `390112` mid-flight
+- parallel queries on a shared `SnowflakeApi` with a lock-free hot path (`arc-swap`) ([`parallel_queries.rs`](./examples/parallel_queries.rs))
+
+### Connection
+- retry middleware that rotates `request_guid` per attempt and writes `retryCount` / `retryReason` / `clientStartTime` on retried `query-request` calls
+- configurable connect and request timeouts
+- credentials and auth tokens wrapped in [`SecretString`](https://docs.rs/secrecy/) (`Debug`-redacted, zeroized on drop)
+- custom reqwest middleware injection ([`tracing/`](./examples/tracing/))
+
+### PUT
+- AWS S3 storage backend
+- glob expansion (`PUT 'file:///tmp/*.csv' @stage`)
+- parallel upload of small files
+
+### Integrations
+- polars `DataFrame` conversion (`polars` feature) ([`polars/`](./examples/polars/))
+
+## Why
+
+Snowflake exposes two HTTP APIs: the public [SQL REST API](https://docs.snowflake.com/developer-guide/sql-api/intro)
+and the undocumented endpoint that the official drivers use. This crate
+targets the latter, since it supports Arrow output and `PUT`/`GET`.
+
+The wire format and retry/cancel semantics follow
+[gosnowflake](https://github.com/snowflakedb/gosnowflake), the Go
+driver, since it outputs Arrow by default and is the most legible
+reference implementation.
+
+## License
+
+Apache-2.0. Original work © Andrew Korzhuev (andrusha/snowflake-rs);
+fork modifications © Will Eaton. See [`LICENSE`](../LICENSE).
+
+[`with_password_auth`]: https://docs.rs/firn/latest/firn/struct.SnowflakeApi.html#method.with_password_auth
+[`with_certificate_auth`]: https://docs.rs/firn/latest/firn/struct.SnowflakeApi.html#method.with_certificate_auth
+[`with_browser_auth`]: https://docs.rs/firn/latest/firn/struct.SnowflakeApi.html#method.with_browser_auth
+[`from_env`]: https://docs.rs/firn/latest/firn/struct.SnowflakeApi.html#method.from_env

@@ -1,11 +1,11 @@
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
 use std::fs;
 
-use snowflake_api::{QueryData, SnowflakeApi};
+use firn::{QueryData, SnowflakeApi};
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum Output {

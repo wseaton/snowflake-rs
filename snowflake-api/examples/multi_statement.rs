@@ -12,11 +12,11 @@
 //! Reads credentials from a local `.env` (via `dotenvy`) and then
 //! `SnowflakeApi::from_env`. See `streaming.rs` for required env vars.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
-use snowflake_api::{QueryData, SnowflakeApi};
+use firn::{QueryData, SnowflakeApi};
 
 const SQL: &str = "\
 SELECT 1 AS a;

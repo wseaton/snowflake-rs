@@ -7,12 +7,12 @@
 //!
 //! Reads credentials from environment variables; see `SnowflakeApi::from_env`.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 
-use snowflake_api::{SnowflakeApi, SnowflakeApiError};
+use firn::{SnowflakeApi, SnowflakeApiError};
 use tokio_util::sync::CancellationToken;
 
 // Procedural wait: not cached by Snowflake's result cache, so we get a

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use polars::frame::DataFrame;
 
-use snowflake_api::SnowflakeApi;
+use firn::SnowflakeApi;
 
 #[tokio::main]
 async fn main() -> Result<()> {

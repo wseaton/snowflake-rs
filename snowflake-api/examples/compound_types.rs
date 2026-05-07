@@ -12,11 +12,11 @@
 //!
 //! Reads credentials from a local `.env`. See `streaming.rs`.
 
-extern crate snowflake_api;
+extern crate firn;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
-use snowflake_api::{QueryData, SnowflakeApi, SnowflakeType};
+use firn::{QueryData, SnowflakeApi, SnowflakeType};
 
 const SQL: &str = "\
 SELECT TO_GEOGRAPHY('POINT(-122.0 37.5)') AS geo,

@@ -1,9 +1,9 @@
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
-use snowflake_api::{QueryData, SnowflakeApi};
+use firn::{QueryData, SnowflakeApi};
 
-extern crate snowflake_api;
+extern crate firn;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
