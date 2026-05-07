@@ -2097,6 +2097,22 @@ mod tests {
     }
 
     #[test]
+    fn snowflake_type_decodes_defensive_variants() {
+        // Map and Decfloat don't surface in current result-set metadata
+        // (Snowflake collapses MAP -> object and DECFLOAT -> text in the
+        // wire); these tests guard the deserialize path for the day the
+        // protocol surfaces them as distinct tags.
+        let map: ExecResponseRowType =
+            serde_json::from_value(json!({"name": "m", "type": "map", "nullable": true})).unwrap();
+        assert_eq!(FieldSchema::from(map).type_, SnowflakeType::Map);
+
+        let decfloat: ExecResponseRowType =
+            serde_json::from_value(json!({"name": "d", "type": "decfloat", "nullable": false}))
+                .unwrap();
+        assert_eq!(FieldSchema::from(decfloat).type_, SnowflakeType::Decfloat);
+    }
+
+    #[test]
     fn rowtype_plain_select_has_no_extension_metadata() {
         let json = json!({
             "name": "n",

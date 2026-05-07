@@ -299,6 +299,18 @@ pub enum SnowflakeType {
     /// real type in `ext_type_name` — they don't need their own
     /// variants here.
     Vector,
+    /// `MAP(<k>, <v>)`. Listed in gosnowflake's converter type table
+    /// (`MapType`) but empirically Snowflake collapses MAP results to
+    /// plain `"object"` on the wire today — this variant exists so
+    /// deserialization doesn't blow up if the protocol ever surfaces a
+    /// distinct `"map"` tag. Defensive parity with gosnowflake.
+    Map,
+    /// IEEE-754 decimal (`DECFLOAT`). Listed in gosnowflake's converter
+    /// table (`DecfloatType`) but at result time Snowflake currently
+    /// demotes DECFLOAT casts to `"text"` on the wire. Defensive
+    /// variant in case the protocol ever surfaces a distinct
+    /// `"decfloat"` tag. Parity with gosnowflake.
+    Decfloat,
 }
 
 #[derive(Deserialize, Debug)]
