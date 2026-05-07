@@ -21,7 +21,9 @@ use snowflake_api::{QueryData, SnowflakeApi, SnowflakeType};
 const SQL: &str = "\
 SELECT TO_GEOGRAPHY('POINT(-122.0 37.5)') AS geo,
        TO_GEOMETRY('POINT(0 0)') AS geom,
-       [1.0, 2.0, 3.0]::VECTOR(FLOAT, 3) AS v";
+       [1.0, 2.0, 3.0]::VECTOR(FLOAT, 3) AS v,
+       {'a': 1, 'b': 2, 'c': 3}::MAP(VARCHAR, INTEGER) AS m,
+       [10, 20, 30]::ARRAY(INTEGER) AS a";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,13 +60,28 @@ async fn main() -> Result<()> {
     }
 
     // Now actually execute and inspect the Arrow result.
-    println!("\n--- execute() ---");
+    println!("\n--- execute() raw ---");
     let r = api.query(SQL).execute().await?;
     println!("query_id = {}", r.metadata.query_id);
+    if let QueryData::Arrow(ref batches) = r.data {
+        if let Some(b) = batches.first() {
+            println!("Arrow schema (default — Snowflake demotes structured types to Utf8 JSON):");
+            for f in b.schema().fields() {
+                println!("  {} : {:?}", f.name(), f.data_type());
+            }
+        }
+    }
+
+    // Snowflake's default wire format demotes MAP / OBJECT / ARRAY to
+    // Utf8 with JSON inside. cast_structured() rebuilds those columns
+    // as proper Arrow Map<Utf8, V> / List<E> with element type inferred
+    // from the data.
+    println!("\n--- execute() + cast_structured() ---");
+    let r = r.cast_structured()?;
     match r.data {
         QueryData::Arrow(batches) => {
             if let Some(b) = batches.first() {
-                println!("Arrow schema:");
+                println!("Arrow schema (after cast):");
                 for f in b.schema().fields() {
                     println!("  {} : {:?}", f.name(), f.data_type());
                 }
