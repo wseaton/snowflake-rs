@@ -2,13 +2,13 @@ use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
-use reqwest_retry::RetryTransientMiddleware;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
+
+use crate::retry::SnowflakeRetryMiddleware;
 
 #[derive(Error, Debug)]
 pub enum ConnectionError {
@@ -124,31 +124,24 @@ impl QueryType {
     }
 }
 
-/// Per-request identifiers Snowflake uses for retry/cancel correlation.
-/// Lifted out of `Connection::request` so the exec path can stash the
-/// `request_id` for later abort.
+/// stable per-request identity, held across retries so cross-task cancel
+/// can locate the in-flight query by id.
 #[derive(Clone, Copy, Debug)]
 pub struct RequestParams {
     pub request_id: Uuid,
-    pub request_guid: Uuid,
 }
 
 impl RequestParams {
     pub fn new() -> Self {
         Self {
             request_id: Uuid::new_v4(),
-            request_guid: Uuid::new_v4(),
         }
     }
 
     /// Build with an optional pre-chosen `request_id`. `None` => fresh.
     pub fn or_new(request_id: Option<Uuid>) -> Self {
-        match request_id {
-            Some(id) => Self {
-                request_id: id,
-                request_guid: Uuid::new_v4(),
-            },
-            None => Self::new(),
+        Self {
+            request_id: request_id.unwrap_or_else(Uuid::new_v4),
         }
     }
 }
@@ -219,15 +212,14 @@ impl Connection {
         let client = client.build()?;
 
         Ok(reqwest_middleware::ClientBuilder::new(client)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy)))
+            .with(SnowflakeRetryMiddleware::new(retry_policy)))
     }
 
-    /// Perform request of given query type with extra body or parameters.
+    /// perform request of given query type with extra body or parameters.
     ///
-    /// `params` carries the `requestId` and `request_guid` URL params. Callers
-    /// that may later need to cancel (the query exec path) should generate
-    /// these via `RequestParams::new()` and hold the `request_id`. Callers
-    /// that don't care can pass `None` and we'll generate fresh ids per call.
+    /// `params` carries the `requestId` url param. the exec path generates
+    /// it via `RequestParams::new()` and holds `request_id` for later abort.
+    /// callers that don't cancel pass `None`.
     // todo: implement soft error handling
     // todo: is there better way to not repeat myself?
     pub async fn request<R: serde::de::DeserializeOwned>(
@@ -242,19 +234,9 @@ impl Connection {
         let context = query_type.query_context();
 
         let params = params.unwrap_or_default();
-        let client_start_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
         let request_id = params.request_id.to_string();
-        let request_guid = params.request_guid.to_string();
 
-        let mut get_params = vec![
-            ("clientStartTime", client_start_time.as_str()),
-            ("requestId", request_id.as_str()),
-            ("request_guid", request_guid.as_str()),
-        ];
+        let mut get_params: Vec<(&str, &str)> = vec![("requestId", request_id.as_str())];
         get_params.extend_from_slice(extra_get_params);
 
         let url = format!(

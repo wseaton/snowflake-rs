@@ -60,6 +60,7 @@ mod polars;
 mod put;
 mod requests;
 mod responses;
+mod retry;
 mod session;
 
 pub use cast::{cast_structured_batch, cast_structured_batch_with_schema};
