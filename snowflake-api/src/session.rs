@@ -92,11 +92,21 @@ impl AuthState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AuthToken {
-    token: String,
+    token: SecretString,
     valid_for: Duration,
     issued_on: Instant,
+}
+
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthToken")
+            .field("token", &"[REDACTED]")
+            .field("valid_for", &self.valid_for)
+            .field("issued_on", &self.issued_on)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,13 +117,11 @@ pub struct AuthParts {
 
 impl AuthToken {
     pub fn new(token: &str, validity_in_seconds: i64) -> Self {
-        let token = token.to_string();
+        let token = SecretString::from(token);
 
         let valid_for = if validity_in_seconds < 0 {
             Duration::from_secs(u64::MAX)
         } else {
-            // Note for reviewer: I beliebe this only fails on negative numbers. I imagine we will
-            // never get negative numbers, but if we do, is MAX or 0 a more sane default?
             Duration::from_secs(u64::try_from(validity_in_seconds).unwrap_or(u64::MAX))
         };
         let issued_on = Instant::now();
@@ -130,7 +138,7 @@ impl AuthToken {
     }
 
     pub fn auth_header(&self) -> String {
-        format!("Snowflake Token=\"{}\"", &self.token)
+        format!("Snowflake Token=\"{}\"", self.token.expose_secret())
     }
 }
 
@@ -343,7 +351,10 @@ impl Session {
             self.sequence_id.store(0, Ordering::Relaxed);
             tokens
         } else {
-            self.renew(&current.expect("checked above")).await?
+            match current {
+                Some(state) => self.renew(&state).await?,
+                None => return Err(AuthError::OutOfOrderRenew),
+            }
         };
 
         let new_state = Arc::new(new_state);
@@ -646,7 +657,7 @@ impl Session {
         log::debug!("Renewing the token");
         let auth = old.master_token.auth_header();
         let body = RenewSessionRequest {
-            old_session_token: old.session_token.token.clone(),
+            old_session_token: old.session_token.token.expose_secret().to_string(),
             request_type: "RENEW".to_string(),
         };
 
