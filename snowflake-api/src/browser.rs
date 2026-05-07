@@ -4,10 +4,16 @@
 //! external browser flow, where the user is redirected to their `IdP` in a browser
 //! and the token is received via a local callback.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::net::TcpListener;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
+use url::Url;
+
+const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024;
+const LISTENER_TIMEOUT: Duration = Duration::from_secs(120);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Error, Debug)]
 pub enum BrowserAuthError {
@@ -16,6 +22,9 @@ pub enum BrowserAuthError {
 
     #[error("Failed to get local address: {0}")]
     LocalAddrFailed(std::io::Error),
+
+    #[error("Timed out waiting for browser callback after {}s", LISTENER_TIMEOUT.as_secs())]
+    Timeout,
 
     #[error("Failed to accept connection: {0}")]
     AcceptFailed(std::io::Error),
@@ -26,8 +35,17 @@ pub enum BrowserAuthError {
     #[error("Invalid request format")]
     InvalidRequest,
 
+    #[error("Expected GET request, got: {0}")]
+    InvalidMethod(String),
+
+    #[error("Request line exceeded {MAX_REQUEST_LINE_BYTES} bytes")]
+    RequestTooLarge,
+
     #[error("Missing token in callback URL: {0}")]
     MissingToken(String),
+
+    #[error("Received empty token in callback")]
+    EmptyToken,
 
     #[error("Failed to URL decode token: {0}")]
     DecodeFailed(String),
@@ -66,15 +84,38 @@ pub fn create_local_listener() -> Result<(TcpListener, u16), BrowserAuthError> {
 ///
 /// The callback comes as: `GET /?token=<url_encoded_token> HTTP/1.1`
 ///
-/// This function blocks until a connection is received and the token is extracted.
+/// Blocks until a connection is received or `LISTENER_TIMEOUT` (120s) expires.
 pub fn wait_for_token(listener: &TcpListener) -> Result<String, BrowserAuthError> {
-    let (mut stream, _addr) = listener.accept().map_err(BrowserAuthError::AcceptFailed)?;
+    listener
+        .set_nonblocking(true)
+        .map_err(BrowserAuthError::ReadFailed)?;
 
-    let mut reader = BufReader::new(&stream);
+    let deadline = Instant::now() + LISTENER_TIMEOUT;
+
+    let (mut stream, _addr) = loop {
+        match listener.accept() {
+            Ok(conn) => break conn,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(BrowserAuthError::Timeout);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => return Err(BrowserAuthError::AcceptFailed(e)),
+        }
+    };
+
+    let limited = (&stream).take(MAX_REQUEST_LINE_BYTES as u64);
+    let mut reader = BufReader::new(limited);
     let mut request_line = String::new();
-    reader
+
+    let bytes_read = reader
         .read_line(&mut request_line)
         .map_err(BrowserAuthError::ReadFailed)?;
+
+    if bytes_read >= MAX_REQUEST_LINE_BYTES {
+        return Err(BrowserAuthError::RequestTooLarge);
+    }
 
     let token = extract_token_from_request(&request_line)?;
 
@@ -128,24 +169,37 @@ Connection: close\r\n\
 }
 
 /// Extract the token from the HTTP request line.
+///
+/// Expects: `GET /?token=<url_encoded_token> HTTP/1.1`
+///
+/// Uses `url::Url` for proper query-string parsing so extra params from the
+/// `IdP` (e.g. `session_state`, `code`) don't leak into the token value.
 fn extract_token_from_request(request_line: &str) -> Result<String, BrowserAuthError> {
-    // request_line looks like: GET /?token=<token> HTTP/1.1
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Err(BrowserAuthError::InvalidRequest);
     }
 
-    let path = parts[1]; // /?token=<token>
-
-    if !path.starts_with("/?token=") {
-        return Err(BrowserAuthError::MissingToken(path.to_string()));
+    let method = parts[0];
+    if method != "GET" {
+        return Err(BrowserAuthError::InvalidMethod(method.to_string()));
     }
 
-    let encoded_token = &path[8..]; // skip "/?token="
+    let path = parts[1];
 
-    let token = urlencoding::decode(encoded_token)
-        .map_err(|e| BrowserAuthError::DecodeFailed(e.to_string()))?
-        .into_owned();
+    // url::Url needs an absolute URL, so we prepend a dummy base
+    let full = format!("http://localhost{path}");
+    let parsed = Url::parse(&full).map_err(|_| BrowserAuthError::InvalidRequest)?;
+
+    let token = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| BrowserAuthError::MissingToken(path.to_string()))?;
+
+    if token.is_empty() {
+        return Err(BrowserAuthError::EmptyToken);
+    }
 
     Ok(token)
 }
@@ -157,33 +211,82 @@ pub fn open_browser(url: &str) -> Result<(), BrowserAuthError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::browser::BrowserAuthError;
+
+    use super::extract_token_from_request;
 
     #[test]
-    fn test_extract_token() {
-        let request = "GET /?token=abc123 HTTP/1.1";
-        let token = extract_token_from_request(request).unwrap();
-        assert_eq!(token, "abc123");
+    fn basic_token() {
+        let req = "GET /?token=abc123 HTTP/1.1";
+        assert_eq!(extract_token_from_request(req).unwrap(), "abc123");
     }
 
     #[test]
-    fn test_extract_token_url_encoded() {
-        let request = "GET /?token=abc%20123 HTTP/1.1";
-        let token = extract_token_from_request(request).unwrap();
-        assert_eq!(token, "abc 123");
+    fn url_encoded_token() {
+        let req = "GET /?token=abc%20123 HTTP/1.1";
+        assert_eq!(extract_token_from_request(req).unwrap(), "abc 123");
     }
 
     #[test]
-    fn test_generate_proof_key() {
-        let key = generate_proof_key();
+    fn extra_query_params_ignored() {
+        let req = "GET /?token=jwt.value.here&session_state=xyz&code=42 HTTP/1.1";
+        assert_eq!(extract_token_from_request(req).unwrap(), "jwt.value.here");
+    }
+
+    #[test]
+    fn token_with_equals_signs() {
+        // base64-encoded JWTs often end with '=' padding
+        let req = "GET /?token=eyJhbGciOi%3D%3D HTTP/1.1";
+        assert_eq!(extract_token_from_request(req).unwrap(), "eyJhbGciOi==");
+    }
+
+    #[test]
+    fn rejects_non_get_method() {
+        let req = "POST /?token=abc123 HTTP/1.1";
+        let err = extract_token_from_request(req).unwrap_err();
+        assert!(matches!(err, BrowserAuthError::InvalidMethod(m) if m == "POST"));
+    }
+
+    #[test]
+    fn rejects_missing_token_param() {
+        let req = "GET /callback HTTP/1.1";
+        assert!(matches!(
+            extract_token_from_request(req).unwrap_err(),
+            BrowserAuthError::MissingToken(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_token() {
+        let req = "GET /?token= HTTP/1.1";
+        assert!(matches!(
+            extract_token_from_request(req).unwrap_err(),
+            BrowserAuthError::EmptyToken
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_request() {
+        let req = "GARBAGE";
+        assert!(matches!(
+            extract_token_from_request(req).unwrap_err(),
+            BrowserAuthError::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_request() {
+        let req = "";
+        assert!(matches!(
+            extract_token_from_request(req).unwrap_err(),
+            BrowserAuthError::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn proof_key_length() {
+        let key = super::generate_proof_key();
         // base64 of 32 bytes is 44 characters
         assert_eq!(key.len(), 44);
-    }
-
-    #[test]
-    fn test_missing_token_error() {
-        let request = "GET /callback HTTP/1.1";
-        let result = extract_token_from_request(request);
-        assert!(matches!(result, Err(BrowserAuthError::MissingToken(_))));
     }
 }
