@@ -240,9 +240,13 @@ pub struct QueryExecResponseData {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecResponseRowType {
+    // Top-level rowtype entries always carry a name. Nested entries
+    // (VECTOR's element-type sub-schema) come back without one — let
+    // serde fall back to "" rather than fail the whole deserialize.
+    #[serde(default)]
     pub name: String,
-    #[serde(rename = "byteLength")]
     pub byte_length: Option<i64>,
     // unused in .NET
     pub length: Option<i64>,
@@ -251,10 +255,28 @@ pub struct ExecResponseRowType {
     pub scale: Option<i64>,
     pub precision: Option<i64>,
     pub nullable: bool,
+    /// Snowflake's extension-type discriminator. For columns whose
+    /// canonical wire `type` is a generic catch-all, the *real* type
+    /// shows up here as an upper-case tag. Observed values include
+    /// `"GEOGRAPHY"` and `"GEOMETRY"` (both ride on `type: "object"`);
+    /// callers that care about the difference should match on this
+    /// rather than `type_`. None for plain types.
+    #[serde(default)]
+    pub ext_type_name: Option<String>,
+    /// Dimensionality for `VECTOR(<element>, N)` columns. Carried in a
+    /// dedicated field rather than `length`/`precision`. None for
+    /// non-vector types.
+    #[serde(default)]
+    pub vector_dimension: Option<i64>,
+    /// Nested sub-schema for parametric types. For `VECTOR(FLOAT, 3)`
+    /// this carries one entry describing the element type
+    /// (`type: "real"` etc.). None / empty for non-parametric types.
+    #[serde(default)]
+    pub fields: Option<Vec<ExecResponseRowType>>,
 }
 
 // fixme: is it good idea to keep this as an enum if more types could be added in future?
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnowflakeType {
     Fixed,
@@ -270,6 +292,13 @@ pub enum SnowflakeType {
     Time,
     Boolean,
     Array,
+    /// `VECTOR(<element>, N)`. Wire tag is plain `"vector"`; the
+    /// dimension and element type live on
+    /// `ExecResponseRowType::vector_dimension` and `fields[0]`.
+    /// `GEOGRAPHY` and `GEOMETRY` ride on [`Self::Object`] with the
+    /// real type in `ext_type_name` — they don't need their own
+    /// variants here.
+    Vector,
 }
 
 #[derive(Deserialize, Debug)]

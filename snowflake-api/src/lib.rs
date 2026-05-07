@@ -135,14 +135,32 @@ impl Display for JsonResult {
     }
 }
 
-/// Based on the [`ExecResponseRowType`]
+/// Based on the [`ExecResponseRowType`]. Carries the full type-info
+/// surface Snowflake returns for a column — `length` / `byte_length` /
+/// extension-type discriminator / VECTOR dimension / nested element
+/// sub-schema — so codegen tools that consume `describe()` output don't
+/// have to fall back to the raw response.
 pub struct FieldSchema {
     pub name: String,
     // todo: is it a good idea to expose internal response struct to the user?
     pub type_: SnowflakeType,
+    pub byte_length: Option<i64>,
+    pub length: Option<i64>,
     pub scale: Option<i64>,
     pub precision: Option<i64>,
     pub nullable: bool,
+    /// Extension-type discriminator. For Snowflake types that ride on a
+    /// generic carrier (notably `GEOGRAPHY` / `GEOMETRY`, both of which
+    /// arrive as `type_: SnowflakeType::Object`), this carries the
+    /// upper-case real type name. Match on this when you need the
+    /// distinction; ignore it for plain columns.
+    pub ext_type_name: Option<String>,
+    /// `VECTOR(<element>, N)` dimensionality. None for non-vector columns.
+    pub vector_dimension: Option<i64>,
+    /// Nested sub-schema for parametric types. For `VECTOR(FLOAT, 3)`
+    /// this carries one entry describing the element. Empty for
+    /// non-parametric columns.
+    pub fields: Vec<FieldSchema>,
 }
 
 impl From<ExecResponseRowType> for FieldSchema {
@@ -150,9 +168,19 @@ impl From<ExecResponseRowType> for FieldSchema {
         FieldSchema {
             name: value.name,
             type_: value.type_,
+            byte_length: value.byte_length,
+            length: value.length,
             scale: value.scale,
             precision: value.precision,
             nullable: value.nullable,
+            ext_type_name: value.ext_type_name,
+            vector_dimension: value.vector_dimension,
+            fields: value
+                .fields
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -2017,7 +2045,77 @@ impl<'a> QueryBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::StatementType;
+    use super::{FieldSchema, SnowflakeType, StatementType};
+    use crate::responses::ExecResponseRowType;
+    use serde_json::json;
+
+    #[test]
+    fn rowtype_geography_rides_on_object_with_ext_type_name() {
+        let json = json!({
+            "name": "GEO",
+            "byteLength": null,
+            "length": null,
+            "type": "object",
+            "scale": null,
+            "precision": null,
+            "nullable": true,
+            "extTypeName": "GEOGRAPHY",
+        });
+        let rt: ExecResponseRowType = serde_json::from_value(json).unwrap();
+        let f: FieldSchema = rt.into();
+        assert_eq!(f.type_, SnowflakeType::Object);
+        assert_eq!(f.ext_type_name.as_deref(), Some("GEOGRAPHY"));
+    }
+
+    #[test]
+    fn rowtype_vector_carries_dimension_and_nested_element() {
+        let json = json!({
+            "name": "V",
+            "byteLength": null,
+            "length": null,
+            "type": "vector",
+            "scale": null,
+            "precision": null,
+            "nullable": true,
+            "vectorDimension": 3,
+            "fields": [{
+                "byteLength": null,
+                "length": null,
+                "type": "real",
+                "scale": null,
+                "precision": null,
+                "nullable": false,
+                "name": "",
+            }],
+        });
+        let rt: ExecResponseRowType = serde_json::from_value(json).unwrap();
+        let f: FieldSchema = rt.into();
+        assert_eq!(f.type_, SnowflakeType::Vector);
+        assert_eq!(f.vector_dimension, Some(3));
+        assert_eq!(f.fields.len(), 1);
+        assert_eq!(f.fields[0].type_, SnowflakeType::Real);
+    }
+
+    #[test]
+    fn rowtype_plain_select_has_no_extension_metadata() {
+        let json = json!({
+            "name": "n",
+            "byteLength": 8,
+            "length": null,
+            "type": "fixed",
+            "scale": 0,
+            "precision": 38,
+            "nullable": false,
+        });
+        let rt: ExecResponseRowType = serde_json::from_value(json).unwrap();
+        let f: FieldSchema = rt.into();
+        assert_eq!(f.type_, SnowflakeType::Fixed);
+        assert!(f.ext_type_name.is_none());
+        assert!(f.vector_dimension.is_none());
+        assert!(f.fields.is_empty());
+        assert_eq!(f.byte_length, Some(8));
+        assert_eq!(f.precision, Some(38));
+    }
 
     #[test]
     fn statement_type_decodes_named_codes() {
