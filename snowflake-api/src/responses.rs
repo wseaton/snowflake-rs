@@ -239,7 +239,7 @@ pub struct QueryExecResponseData {
     // `sendResultTime`, `queryResultFormat`, `queryContext` also exist
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecResponseRowType {
     // Top-level rowtype entries always carry a name. Nested entries

@@ -52,6 +52,7 @@ use crate::session::AuthError::MissingEnvArgument;
 
 #[cfg(feature = "browser-auth")]
 mod browser;
+mod cast;
 pub mod connection;
 #[cfg(feature = "polars")]
 mod polars;
@@ -59,6 +60,8 @@ mod put;
 mod requests;
 mod responses;
 mod session;
+
+pub use cast::cast_structured_batch;
 
 #[derive(Error, Debug)]
 pub enum SnowflakeApiError {
@@ -140,6 +143,7 @@ impl Display for JsonResult {
 /// extension-type discriminator / VECTOR dimension / nested element
 /// sub-schema — so codegen tools that consume `describe()` output don't
 /// have to fall back to the raw response.
+#[derive(Debug, Clone)]
 pub struct FieldSchema {
     pub name: String,
     // todo: is it a good idea to expose internal response struct to the user?
@@ -216,6 +220,13 @@ pub struct QueryMetadata {
     /// [`QueryBuilder::execute_multi`] / [`QueryBuilder::execute_multi_exact`]).
     /// Empty for normal single-statement queries.
     pub result_ids: Vec<String>,
+    /// Per-column schema as returned in the response `rowtype`. Empty
+    /// for paths without a row schema (PUT / GET). Carries
+    /// `ext_type_name` / `vector_dimension` / nested `fields` so
+    /// callers can branch on `GEOGRAPHY` vs plain `OBJECT`, read a
+    /// `VECTOR(FLOAT, N)` dimension, etc., without an extra
+    /// `describe()` round-trip.
+    pub column_schema: Vec<FieldSchema>,
 }
 
 impl QueryMetadata {
@@ -507,6 +518,8 @@ fn metadata_and_body_from(
         })
         .unwrap_or_default();
 
+    let column_schema: Vec<FieldSchema> = data.rowtype.into_iter().map(Into::into).collect();
+
     let metadata = QueryMetadata {
         query_id: data.query_id,
         total_rows: Some(data.total),
@@ -517,6 +530,7 @@ fn metadata_and_body_from(
         schema: data.final_schema_name,
         role: Some(data.final_role_name),
         result_ids,
+        column_schema: column_schema.clone(),
     };
 
     let body = if data.returned == 0 {
@@ -526,7 +540,7 @@ fn metadata_and_body_from(
         // (debugging path); the default for SELECT is Arrow.
         ResolvedArrowResult::Json(JsonResult {
             value,
-            schema: data.rowtype.into_iter().map(Into::into).collect(),
+            schema: column_schema,
         })
     } else if let Some(base64) = data.rowset_base64 {
         ResolvedArrowResult::Chunked {
@@ -558,6 +572,20 @@ fn build_record_batch_stream(raw: ArrowChunkStream) -> RecordBatchStream {
         },
     })
     .boxed()
+}
+
+impl QueryResult {
+    /// Rewrite Utf8-with-JSON columns into Arrow `Map<Utf8, V>` /
+    /// `List<E>`. Uses `metadata.column_schema` to skip `GEOGRAPHY` /
+    /// `GEOMETRY` columns. No-op when no columns need rewriting.
+    pub fn cast_structured(mut self) -> Result<Self, ArrowError> {
+        if let QueryData::Arrow(ref mut batches) = self.data {
+            for b in batches.iter_mut() {
+                *b = cast::cast_structured_batch_with_schema(b, &self.metadata.column_schema)?;
+            }
+        }
+        Ok(self)
+    }
 }
 
 impl RawQueryResult {
@@ -959,6 +987,7 @@ impl SnowflakeApi {
                     schema: None,
                     result_ids: Vec::new(),
                     role: None,
+                    column_schema: Vec::new(),
                 };
                 put::put(pg).await?;
                 Ok(metadata)
