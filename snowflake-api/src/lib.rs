@@ -1206,11 +1206,14 @@ impl SnowflakeApi {
     /// returns "Query is no longer running" as a normal result and we
     /// surface `Ok(())`.
     pub async fn cancel_query_by_id(&self, query_id: &str) -> Result<(), SnowflakeApiError> {
-        // Query ids are UUID-like; defensive escape for single quotes
-        // in case Snowflake ever loosens the format.
-        let escaped = query_id.replace('\'', "''");
-        let sql = format!("SELECT SYSTEM$CANCEL_QUERY('{escaped}')");
-        log::debug!("Cancelling query by id {query_id}");
+        let parsed = Uuid::parse_str(query_id).map_err(|_| {
+            SnowflakeApiError::ApiError(
+                "INVALID_QUERY_ID".into(),
+                format!("query_id is not a valid UUID: {query_id}"),
+            )
+        })?;
+        let sql = format!("SELECT SYSTEM$CANCEL_QUERY('{parsed}')");
+        log::debug!("Cancelling query by id {parsed}");
         self.exec(&sql).await?;
         Ok(())
     }

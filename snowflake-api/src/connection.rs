@@ -26,6 +26,9 @@ pub enum ConnectionError {
 
     #[error(transparent)]
     InvalidHeader(#[from] header::InvalidHeaderValue),
+
+    #[error(transparent)]
+    InvalidHeaderName(#[from] header::InvalidHeaderName),
 }
 
 /// Container for query parameters
@@ -190,7 +193,9 @@ impl Connection {
         let client = reqwest::ClientBuilder::new()
             .user_agent("Rust/0.0.1")
             .gzip(true)
-            .referer(false);
+            .referer(false)
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(300));
 
         #[cfg(debug_assertions)]
         let client = client.connection_verbose(true);
@@ -292,8 +297,8 @@ impl Connection {
         let mut header_map = HeaderMap::new();
         for (k, v) in headers {
             header_map.insert(
-                HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                HeaderValue::from_bytes(v.as_bytes()).unwrap(),
+                HeaderName::from_bytes(k.as_bytes())?,
+                HeaderValue::from_bytes(v.as_bytes())?,
             );
         }
         let bytes = self
