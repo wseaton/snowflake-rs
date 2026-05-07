@@ -33,6 +33,7 @@ use uuid::Uuid;
 // Part of public interface
 pub use arrow_array::RecordBatch;
 pub use arrow_schema::ArrowError;
+pub use secrecy::SecretString;
 
 pub use crate::responses::SnowflakeType;
 
@@ -662,9 +663,13 @@ impl AuthArgs {
             _ => {
                 // Fall back to password or certificate auth
                 if let Ok(password) = std::env::var("SNOWFLAKE_PASSWORD") {
-                    Ok(AuthType::Password(PasswordArgs { password }))
+                    Ok(AuthType::Password(PasswordArgs {
+                        password: SecretString::from(password),
+                    }))
                 } else if let Ok(private_key_pem) = std::env::var("SNOWFLAKE_PRIVATE_KEY") {
-                    Ok(AuthType::Certificate(CertificateArgs { private_key_pem }))
+                    Ok(AuthType::Certificate(CertificateArgs {
+                        private_key_pem: SecretString::from(private_key_pem),
+                    }))
                 } else {
                     #[cfg(feature = "browser-auth")]
                     {
@@ -704,11 +709,11 @@ pub enum AuthType {
 }
 
 pub struct PasswordArgs {
-    pub password: String,
+    pub password: SecretString,
 }
 
 pub struct CertificateArgs {
-    pub private_key_pem: String,
+    pub private_key_pem: SecretString,
 }
 
 /// Default heartbeat interval when `client_session_keep_alive` is enabled
@@ -768,7 +773,7 @@ impl SnowflakeApiBuilder {
                 self.auth.schema.as_deref(),
                 &self.auth.username,
                 self.auth.role.as_deref(),
-                &args.password,
+                args.password,
             ),
             AuthType::Certificate(args) => Session::cert_auth(
                 Arc::clone(&connection),
@@ -778,7 +783,7 @@ impl SnowflakeApiBuilder {
                 self.auth.schema.as_deref(),
                 &self.auth.username,
                 self.auth.role.as_deref(),
-                &args.private_key_pem,
+                args.private_key_pem,
             ),
             #[cfg(feature = "browser-auth")]
             AuthType::ExternalBrowser => Session::browser_auth(
@@ -878,7 +883,7 @@ impl SnowflakeApi {
             schema,
             username,
             role,
-            password,
+            SecretString::from(password),
         );
 
         let account_identifier = account_identifier.to_uppercase();
@@ -909,7 +914,7 @@ impl SnowflakeApi {
             schema,
             username,
             role,
-            private_key_pem,
+            SecretString::from(private_key_pem),
         );
 
         let account_identifier = account_identifier.to_uppercase();

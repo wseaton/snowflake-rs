@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use futures::lock::Mutex;
+use secrecy::{ExposeSecret, SecretString};
 #[cfg(feature = "cert-auth")]
 use snowflake_jwt::generate_jwt_token;
 use thiserror::Error;
@@ -161,8 +162,8 @@ pub struct Session {
     role: Option<String>,
     // This is not used with the certificate auth crate
     #[allow(dead_code)]
-    private_key_pem: Option<String>,
-    password: Option<String>,
+    private_key_pem: Option<SecretString>,
+    password: Option<SecretString>,
 }
 
 // todo: make builder
@@ -178,9 +179,8 @@ impl Session {
         schema: Option<&str>,
         username: &str,
         role: Option<&str>,
-        private_key_pem: &str,
+        private_key_pem: SecretString,
     ) -> Self {
-        // uppercase everything as this is the convention
         let account_identifier = account_identifier.to_uppercase();
 
         let database = database.map(str::to_uppercase);
@@ -188,7 +188,6 @@ impl Session {
 
         let username = username.to_uppercase();
         let role = role.map(str::to_uppercase);
-        let private_key_pem = Some(private_key_pem.to_string());
 
         Self {
             connection,
@@ -196,7 +195,7 @@ impl Session {
             sequence_id: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             auth_type: AuthType::Certificate,
-            private_key_pem,
+            private_key_pem: Some(private_key_pem),
             account_identifier,
             warehouse: warehouse.map(str::to_uppercase),
             database,
@@ -218,7 +217,7 @@ impl Session {
         schema: Option<&str>,
         username: &str,
         role: Option<&str>,
-        password: &str,
+        password: SecretString,
     ) -> Self {
         let account_identifier = account_identifier.to_uppercase();
 
@@ -226,7 +225,6 @@ impl Session {
         let schema = schema.map(str::to_uppercase);
 
         let username = username.to_uppercase();
-        let password = Some(password.to_string());
         let role = role.map(str::to_uppercase);
 
         Self {
@@ -240,7 +238,7 @@ impl Session {
             database,
             username,
             role,
-            password,
+            password: Some(password),
             schema,
             private_key_pem: None,
         }
@@ -424,7 +422,7 @@ impl Session {
             .private_key_pem
             .as_ref()
             .ok_or(AuthError::MissingCertificate)?;
-        let jwt_token = generate_jwt_token(private_key_pem, &full_identifier)?;
+        let jwt_token = generate_jwt_token(private_key_pem.expose_secret(), &full_identifier)?;
 
         Ok(CertLoginRequest {
             data: CertRequestData {
@@ -441,7 +439,7 @@ impl Session {
         Ok(PasswordLoginRequest {
             data: PasswordRequestData {
                 login_request_common: self.login_request_common(),
-                password: password.clone(),
+                password: password.expose_secret().to_string(),
             },
         })
     }
