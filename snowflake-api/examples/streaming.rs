@@ -89,11 +89,7 @@ async fn main() -> Result<()> {
             while let Some(blob) = stream.next().await {
                 let blob = blob?;
                 idx += 1;
-                let pct = if total_chunks > 0 {
-                    (idx * 100) / total_chunks
-                } else {
-                    0
-                };
+                let pct = (idx * 100).checked_div(total_chunks).unwrap_or(0);
                 println!(
                     "chunk {idx}/{total_chunks} ({pct}%): {} bytes of Arrow IPC",
                     blob.len()

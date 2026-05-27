@@ -18,8 +18,8 @@ use crate::requests::{
 #[cfg(feature = "cert-auth")]
 use crate::requests::{CertLoginRequest, CertRequestData};
 use crate::requests::{
-    ClientEnvironment, LoginRequest, LoginRequestCommon, PasswordLoginRequest, PasswordRequestData,
-    RenewSessionRequest, SessionParameters,
+    ClientEnvironment, LoginRequest, LoginRequestCommon, OAuthLoginRequest, OAuthRequestData,
+    PasswordLoginRequest, PasswordRequestData, RenewSessionRequest, SessionParameters,
 };
 use crate::responses::{AuthResponse, BaseRestResponse};
 
@@ -34,12 +34,6 @@ pub enum AuthError {
 
     #[error("Environment variable `{0}` is required, but were not set")]
     MissingEnvArgument(String),
-
-    #[error("Password auth was requested, but password wasn't provided")]
-    MissingPassword,
-
-    #[error("Certificate auth was requested, but certificate wasn't provided")]
-    MissingCertificate,
 
     #[error("Unexpected API response")]
     UnexpectedResponse,
@@ -143,8 +137,9 @@ impl AuthToken {
 }
 
 enum AuthType {
-    Certificate,
-    Password,
+    Certificate(#[cfg_attr(not(feature = "cert-auth"), allow(dead_code))] SecretString),
+    Password(SecretString),
+    OAuth(SecretString),
     #[cfg(feature = "browser-auth")]
     Browser,
 }
@@ -171,20 +166,42 @@ pub struct Session {
 
     username: String,
     role: Option<String>,
-    // This is not used with the certificate auth crate
-    #[allow(dead_code)]
-    private_key_pem: Option<SecretString>,
-    password: Option<SecretString>,
     login_timeout: Duration,
 }
 
 /// <https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L27-L28>
-const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 
 // todo: make builder
 impl Session {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        connection: Arc<Connection>,
+        auth_type: AuthType,
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+    ) -> Self {
+        Self {
+            connection,
+            auth_state: ArcSwapOption::empty(),
+            sequence_id: AtomicU64::new(0),
+            refresh_lock: Mutex::new(()),
+            auth_type,
+            account_identifier: account_identifier.to_uppercase(),
+            warehouse: warehouse.map(str::to_uppercase),
+            database: database.map(str::to_uppercase),
+            schema: schema.map(str::to_uppercase),
+            username: username.to_uppercase(),
+            role: role.map(str::to_uppercase),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+        }
+    }
+
     /// Authenticate using private certificate and JWT
-    // fixme: add builder or introduce structs
     #[allow(clippy::too_many_arguments)]
     pub fn cert_auth(
         connection: Arc<Connection>,
@@ -196,34 +213,19 @@ impl Session {
         role: Option<&str>,
         private_key_pem: SecretString,
     ) -> Self {
-        let account_identifier = account_identifier.to_uppercase();
-
-        let database = database.map(str::to_uppercase);
-        let schema = schema.map(str::to_uppercase);
-
-        let username = username.to_uppercase();
-        let role = role.map(str::to_uppercase);
-
-        Self {
+        Self::new(
             connection,
-            auth_state: ArcSwapOption::empty(),
-            sequence_id: AtomicU64::new(0),
-            refresh_lock: Mutex::new(()),
-            auth_type: AuthType::Certificate,
-            private_key_pem: Some(private_key_pem),
+            AuthType::Certificate(private_key_pem),
             account_identifier,
-            warehouse: warehouse.map(str::to_uppercase),
+            warehouse,
             database,
+            schema,
             username,
             role,
-            schema,
-            password: None,
-            login_timeout: DEFAULT_LOGIN_TIMEOUT,
-        }
+        )
     }
 
     /// Authenticate using password
-    // fixme: add builder or introduce structs
     #[allow(clippy::too_many_arguments)]
     pub fn password_auth(
         connection: Arc<Connection>,
@@ -235,30 +237,42 @@ impl Session {
         role: Option<&str>,
         password: SecretString,
     ) -> Self {
-        let account_identifier = account_identifier.to_uppercase();
-
-        let database = database.map(str::to_uppercase);
-        let schema = schema.map(str::to_uppercase);
-
-        let username = username.to_uppercase();
-        let role = role.map(str::to_uppercase);
-
-        Self {
+        Self::new(
             connection,
-            auth_state: ArcSwapOption::empty(),
-            sequence_id: AtomicU64::new(0),
-            refresh_lock: Mutex::new(()),
-            auth_type: AuthType::Password,
+            AuthType::Password(password),
             account_identifier,
-            warehouse: warehouse.map(str::to_uppercase),
+            warehouse,
             database,
+            schema,
             username,
             role,
-            password: Some(password),
+        )
+    }
+
+    /// Authenticate using a pre-obtained OAuth access token. The token must
+    /// be issued by an `IdP` Snowflake trusts for the target account; the
+    /// `username` must match the Snowflake user the token was minted for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn oauth_auth(
+        connection: Arc<Connection>,
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+        token: SecretString,
+    ) -> Self {
+        Self::new(
+            connection,
+            AuthType::OAuth(token),
+            account_identifier,
+            warehouse,
+            database,
             schema,
-            private_key_pem: None,
-            login_timeout: DEFAULT_LOGIN_TIMEOUT,
-        }
+            username,
+            role,
+        )
     }
 
     /// Authenticate using external browser SSO
@@ -273,30 +287,16 @@ impl Session {
         username: &str,
         role: Option<&str>,
     ) -> Self {
-        let account_identifier = account_identifier.to_uppercase();
-
-        let database = database.map(str::to_uppercase);
-        let schema = schema.map(str::to_uppercase);
-
-        let username = username.to_uppercase();
-        let role = role.map(str::to_uppercase);
-
-        Self {
+        Self::new(
             connection,
-            auth_state: ArcSwapOption::empty(),
-            sequence_id: AtomicU64::new(0),
-            refresh_lock: Mutex::new(()),
-            auth_type: AuthType::Browser,
+            AuthType::Browser,
             account_identifier,
-            warehouse: warehouse.map(str::to_uppercase),
+            warehouse,
             database,
+            schema,
             username,
             role,
-            password: None,
-            schema,
-            private_key_pem: None,
-            login_timeout: DEFAULT_LOGIN_TIMEOUT,
-        }
+        )
     }
 
     pub fn set_login_timeout(&mut self, timeout: Duration) {
@@ -328,18 +328,21 @@ impl Session {
             .is_none_or(|s| s.master_token.is_expired());
 
         let new_state = if need_full_create {
-            let tokens = match self.auth_type {
-                AuthType::Certificate => {
+            let tokens = match &self.auth_type {
+                #[cfg(feature = "cert-auth")]
+                AuthType::Certificate(pem) => {
                     log::info!("Starting session with certificate authentication");
-                    if cfg!(feature = "cert-auth") {
-                        self.create(self.cert_request_body()?).await?
-                    } else {
-                        return Err(AuthError::MissingCertificate);
-                    }
+                    self.create(self.cert_request_body(pem)?).await?
                 }
-                AuthType::Password => {
+                #[cfg(not(feature = "cert-auth"))]
+                AuthType::Certificate(_) => return Err(AuthError::CertAuthNotEnabled),
+                AuthType::Password(pw) => {
                     log::info!("Starting session with password authentication");
-                    self.create(self.passwd_request_body()?).await?
+                    self.create(self.passwd_request_body(pw)).await?
+                }
+                AuthType::OAuth(tok) => {
+                    log::info!("Starting session with OAuth authentication");
+                    self.create(self.oauth_request_body(tok)).await?
                 }
                 #[cfg(feature = "browser-auth")]
                 AuthType::Browser => {
@@ -382,18 +385,21 @@ impl Session {
         let new_state = match current.as_deref() {
             Some(s) if !s.master_token.is_expired() => self.renew(s).await?,
             _ => {
-                let tokens = match self.auth_type {
-                    AuthType::Certificate => {
+                let tokens = match &self.auth_type {
+                    #[cfg(feature = "cert-auth")]
+                    AuthType::Certificate(pem) => {
                         log::info!("Re-creating session (certificate auth)");
-                        if cfg!(feature = "cert-auth") {
-                            self.create(self.cert_request_body()?).await?
-                        } else {
-                            return Err(AuthError::MissingCertificate);
-                        }
+                        self.create(self.cert_request_body(pem)?).await?
                     }
-                    AuthType::Password => {
+                    #[cfg(not(feature = "cert-auth"))]
+                    AuthType::Certificate(_) => return Err(AuthError::CertAuthNotEnabled),
+                    AuthType::Password(pw) => {
                         log::info!("Re-creating session (password auth)");
-                        self.create(self.passwd_request_body()?).await?
+                        self.create(self.passwd_request_body(pw)).await?
+                    }
+                    AuthType::OAuth(tok) => {
+                        log::info!("Re-creating session (OAuth auth)");
+                        self.create(self.oauth_request_body(tok)).await?
                     }
                     #[cfg(feature = "browser-auth")]
                     AuthType::Browser => {
@@ -441,12 +447,11 @@ impl Session {
     }
 
     #[cfg(feature = "cert-auth")]
-    fn cert_request_body(&self) -> Result<CertLoginRequest, AuthError> {
+    fn cert_request_body(
+        &self,
+        private_key_pem: &SecretString,
+    ) -> Result<CertLoginRequest, AuthError> {
         let full_identifier = format!("{}.{}", &self.account_identifier, &self.username);
-        let private_key_pem = self
-            .private_key_pem
-            .as_ref()
-            .ok_or(AuthError::MissingCertificate)?;
         let jwt_token = generate_jwt_token(private_key_pem.expose_secret(), &full_identifier)?;
 
         Ok(CertLoginRequest {
@@ -458,15 +463,23 @@ impl Session {
         })
     }
 
-    fn passwd_request_body(&self) -> Result<PasswordLoginRequest, AuthError> {
-        let password = self.password.as_ref().ok_or(AuthError::MissingPassword)?;
-
-        Ok(PasswordLoginRequest {
+    fn passwd_request_body(&self, password: &SecretString) -> PasswordLoginRequest {
+        PasswordLoginRequest {
             data: PasswordRequestData {
                 login_request_common: self.login_request_common(),
                 password: password.expose_secret().to_string(),
             },
-        })
+        }
+    }
+
+    fn oauth_request_body(&self, token: &SecretString) -> OAuthLoginRequest {
+        OAuthLoginRequest {
+            data: OAuthRequestData {
+                login_request_common: self.login_request_common(),
+                authenticator: "OAUTH".to_string(),
+                token: token.expose_secret().to_string(),
+            },
+        }
     }
 
     /// Start new session, all the Snowflake temporary objects will be scoped towards it,

@@ -13,7 +13,7 @@ use url::Url;
 
 const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024;
 /// <https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L33-L34>
-const LISTENER_TIMEOUT: Duration = Duration::from_secs(120);
+const LISTENER_TIMEOUT: Duration = Duration::from_mins(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Error, Debug)]

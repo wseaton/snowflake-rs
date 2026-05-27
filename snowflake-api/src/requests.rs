@@ -149,6 +149,7 @@ pub type PasswordLoginRequest = LoginRequest<PasswordRequestData>;
 pub type CertLoginRequest = LoginRequest<CertRequestData>;
 #[cfg(feature = "browser-auth")]
 pub type BrowserLoginRequest = LoginRequest<BrowserRequestData>;
+pub type OAuthLoginRequest = LoginRequest<OAuthRequestData>;
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -185,9 +186,22 @@ pub struct PasswordRequestData {
     pub password: String,
 }
 
+#[cfg(feature = "cert-auth")]
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct CertRequestData {
+    #[serde(flatten)]
+    pub login_request_common: LoginRequestCommon,
+    pub authenticator: String,
+    pub token: String,
+}
+
+/// Login body for OAuth. Snowflake's REST login accepts `AUTHENTICATOR: OAUTH`
+/// with the access token in `TOKEN`; the `LOGIN_NAME` in `login_request_common`
+/// still has to match the Snowflake user the token was issued for.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct OAuthRequestData {
     #[serde(flatten)]
     pub login_request_common: LoginRequestCommon,
     pub authenticator: String,

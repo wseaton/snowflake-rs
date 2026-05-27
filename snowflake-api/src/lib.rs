@@ -661,8 +661,15 @@ impl AuthArgs {
         let auth_type = match authenticator.as_deref() {
             #[cfg(feature = "browser-auth")]
             Some("externalbrowser") => Ok(AuthType::ExternalBrowser),
+            Some("oauth") => {
+                let token = std::env::var("SNOWFLAKE_TOKEN")
+                    .map_err(|_| MissingEnvArgument("SNOWFLAKE_TOKEN".to_owned()))?;
+                Ok(AuthType::OAuth(OAuthArgs {
+                    token: SecretString::from(token),
+                }))
+            }
             _ => {
-                // Fall back to password or certificate auth
+                // Fall back to password / cert / oauth based on which secret is set
                 if let Ok(password) = std::env::var("SNOWFLAKE_PASSWORD") {
                     Ok(AuthType::Password(PasswordArgs {
                         password: SecretString::from(password),
@@ -671,17 +678,22 @@ impl AuthArgs {
                     Ok(AuthType::Certificate(CertificateArgs {
                         private_key_pem: SecretString::from(private_key_pem),
                     }))
+                } else if let Ok(token) = std::env::var("SNOWFLAKE_TOKEN") {
+                    Ok(AuthType::OAuth(OAuthArgs {
+                        token: SecretString::from(token),
+                    }))
                 } else {
                     #[cfg(feature = "browser-auth")]
                     {
                         Err(MissingEnvArgument(
-                            "SNOWFLAKE_PASSWORD, SNOWFLAKE_PRIVATE_KEY, or SNOWFLAKE_AUTHENTICATOR=externalbrowser".to_owned(),
+                            "SNOWFLAKE_PASSWORD, SNOWFLAKE_PRIVATE_KEY, SNOWFLAKE_TOKEN, or SNOWFLAKE_AUTHENTICATOR=externalbrowser|oauth".to_owned(),
                         ))
                     }
                     #[cfg(not(feature = "browser-auth"))]
                     {
                         Err(MissingEnvArgument(
-                            "SNOWFLAKE_PASSWORD or SNOWFLAKE_PRIVATE_KEY".to_owned(),
+                            "SNOWFLAKE_PASSWORD, SNOWFLAKE_PRIVATE_KEY, or SNOWFLAKE_TOKEN"
+                                .to_owned(),
                         ))
                     }
                 }
@@ -705,6 +717,7 @@ impl AuthArgs {
 pub enum AuthType {
     Password(PasswordArgs),
     Certificate(CertificateArgs),
+    OAuth(OAuthArgs),
     #[cfg(feature = "browser-auth")]
     ExternalBrowser,
 }
@@ -717,13 +730,17 @@ pub struct CertificateArgs {
     pub private_key_pem: SecretString,
 }
 
+pub struct OAuthArgs {
+    pub token: SecretString,
+}
+
 /// Default heartbeat interval when `client_session_keep_alive` is enabled
 /// without an explicit value. Matches gosnowflake's typical effective period
 /// (`master_validity / 4`, with `master_validity` defaulting to 4h).
-const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_hours(1);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// <https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L27-L28>
-const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[must_use]
 pub struct SnowflakeApiBuilder {
@@ -822,6 +839,16 @@ impl SnowflakeApiBuilder {
                 &self.auth.username,
                 self.auth.role.as_deref(),
                 args.private_key_pem,
+            ),
+            AuthType::OAuth(args) => Session::oauth_auth(
+                Arc::clone(&connection),
+                &self.auth.account_identifier,
+                self.auth.warehouse.as_deref(),
+                self.auth.database.as_deref(),
+                self.auth.schema.as_deref(),
+                &self.auth.username,
+                self.auth.role.as_deref(),
+                args.token,
             ),
             #[cfg(feature = "browser-auth")]
             AuthType::ExternalBrowser => Session::browser_auth(
@@ -955,6 +982,40 @@ impl SnowflakeApi {
             username,
             role,
             SecretString::from(private_key_pem),
+        );
+
+        let account_identifier = account_identifier.to_uppercase();
+        Ok(Self::new(
+            Arc::clone(&connection),
+            session,
+            account_identifier,
+        ))
+    }
+
+    /// Initialize object with OAuth auth. Authentication happens on the first request.
+    /// The token must be an access token issued by an `IdP` Snowflake trusts for this account;
+    /// `username` must match the Snowflake user the token was minted for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_oauth_auth(
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+        token: &str,
+    ) -> Result<Self, SnowflakeApiError> {
+        let connection = Arc::new(Connection::new()?);
+
+        let session = Session::oauth_auth(
+            Arc::clone(&connection),
+            account_identifier,
+            warehouse,
+            database,
+            schema,
+            username,
+            role,
+            SecretString::from(token),
         );
 
         let account_identifier = account_identifier.to_uppercase();
